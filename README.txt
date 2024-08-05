@@ -1,3 +1,5 @@
+Accompanying github for "Reversing File Access Control Using Disk Forensics on Low-Level Flash Memory" by Caleb Rother (crother@mtu.edu) and Bo Chen (bchen@mtu.edu)
+
 Credit to OpenNFM for the initial FTL software this project is based on.
 
 This is code meant for an LPC-H3131 board to be compiled using IAR embedded workbench. No further results can be guaranteed. At current, a compiled binary can be found in /prj/iar/debug/exe if you want to flash directly to the drive.
@@ -11,3 +13,7 @@ This firmware accepts commands via a write to page 235000 of the drive. This can
 2: Undo any permission writes present in the cache and clear it.
 
 3: Clear the cache.
+
+
+A demo can be found at
+https://www.youtube.com/watch?v=QOMwqykwpvE
