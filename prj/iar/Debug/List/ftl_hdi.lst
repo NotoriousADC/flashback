@@ -1,0 +1,236 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_hdi.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_hdi.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\ftl_hdi.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\ftl_hdi.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_hdi.c
+      1          /*********************************************************
+      2           * Module name: ftl_hdi.c
+      3           *
+      4           * Copyright 2010, 2011. All Rights Reserved, Crane Chu.
+      5           *
+      6           * This file is part of OpenNFM.
+      7           *
+      8           * OpenNFM is free software: you can redistribute it and/or 
+      9           * modify it under the terms of the GNU General Public 
+     10           * License as published by the Free Software Foundation, 
+     11           * either version 3 of the License, or (at your option) any 
+     12           * later version.
+     13           * 
+     14           * OpenNFM is distributed in the hope that it will be useful,
+     15           * but WITHOUT ANY WARRANTY; without even the implied 
+     16           * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     17           * PURPOSE. See the GNU General Public License for more 
+     18           * details.
+     19           *
+     20           * You should have received a copy of the GNU General Public 
+     21           * License along with OpenNFM. If not, see 
+     22           * <http://www.gnu.org/licenses/>.
+     23           *
+     24           * First written on 2010-01-01 by cranechu@gmail.com
+     25           *
+     26           * Module Description:
+     27           *    Hot Data Identification
+     28           *
+     29           *********************************************************/
+     30          
+     31          #include <core\inc\cmn.h>
+     32          #include <core\inc\ubi.h>
+     33          #include <sys\sys.h>
+     34          #include "ftl_inc.h"
+     35          
+     36          static UINT8 hdi_hash_table[MPP_SIZE];
+     37          static PAGE_OFF hdi_current_page;
+     38          static LOG_BLOCK hdi_current_block;
+     39          
+     40          /* TODO: choose other hash functions and parameters to optimize HDI */
+     41          #define HDI_FUNCTION(a, i)          (((a)>>((i)*3))&(MPP_SIZE-1))
+     42          #define HDI_FUNC_COUNT              (4)
+     43          #define HDI_HOT_DATA_THERSHOLD      (0x60)
+     44          #define HDI_COLDDOWN_DELAY          (0x1000)
+     45          
+     46          STATUS HDI_Format() {
+     47            UINT32 i;
+     48            STATUS ret;
+     49          
+     50            for (i = 0; i < MPP_SIZE; i++) {
+     51              hdi_hash_table[i] = 0;
+     52            }
+     53          
+     54            hdi_current_block = HDI_BLOCK0;
+     55            hdi_current_page = 0;
+     56          
+     57            ret = UBI_Erase(hdi_current_block, hdi_current_block);
+     58            if (ret == STATUS_SUCCESS) {
+     59              /* write to UBI */
+     60              ret = HDI_Commit();
+     61            }
+     62          
+     63            return ret;
+     64          }
+     65          
+     66          STATUS HDI_Init() {
+     67            UINT32 i;
+     68            STATUS ret = STATUS_SUCCESS;
+     69          
+     70            hdi_current_block = PM_NODE_BLOCK(root_table.hdi_current_journal);
+     71            hdi_current_page = PM_NODE_PAGE(root_table.hdi_current_journal);
+     72          
+     73            /* read out the valid page of table */
+     74            ret = UBI_Read(hdi_current_block, hdi_current_page, hdi_hash_table, NULL);
+     75            ASSERT(ret == STATUS_SUCCESS);
+     76          
+     77            /* scan for the first erased page */
+     78            for (i = hdi_current_page + 1; i < PAGE_PER_PHY_BLOCK; i++) {
+     79              ret = UBI_Read(hdi_current_block, i, NULL, NULL);
+     80              if (ret != STATUS_SUCCESS) {
+     81                /* this page is not programmed */
+     82                hdi_current_page = i;
+     83                ret = STATUS_SUCCESS;
+     84                break;
+     85              }
+     86            }
+     87          
+     88            if (i == PAGE_PER_PHY_BLOCK) {
+     89              ASSERT(ret == STATUS_SUCCESS);
+     90              /* current block is full */
+     91              hdi_current_page = PAGE_PER_PHY_BLOCK;
+     92            }
+     93          
+     94            if (ret == STATUS_SUCCESS) {
+     95              /* skip one page for possible PLR issue */
+     96              //jsj修改
+     97              //(void) BDT_Commit();
+     98              (void) HDI_Commit();
+     99            }
+    100          
+    101            return ret;
+    102          }
+    103          
+    104          BOOL HDI_IsHotPage(PGADDR addr) {
+    105            static UINT32 count = 0;
+    106            UINT32 i;
+    107            UINT8* hot_value;
+    108            BOOL ret = TRUE;
+    109          
+    110            /* increase all hash slots when writing the page */
+    111            for (i = 0; i < HDI_FUNC_COUNT; i++) {//4
+    112              hot_value = &hdi_hash_table[HDI_FUNCTION(addr, i)];
+    113          
+    114              if (*hot_value != MAX_UINT8) {
+    115                (*hot_value)++;
+    116              }
+    117          
+    118              if (*hot_value < HDI_HOT_DATA_THERSHOLD) {//0x60=96
+    119                ret = FALSE;
+    120              }
+    121            }
+    122          
+    123            /* cold down the hash table after every XXX times of access */
+    124            if (count++ == HDI_COLDDOWN_DELAY) {//4096
+    125              for (i = 0; i < MPP_SIZE; i++) {
+    126                hdi_hash_table[i] >>= 1;
+    127              }
+    128              count = 0;
+    129            }
+    130          
+    131            return ret;
+    132          }
+    133          
+    134          STATUS HDI_Commit() {
+    135            STATUS ret = STATUS_SUCCESS;
+    136            LOG_BLOCK next_block = INVALID_BLOCK;
+    137          
+    138            if (hdi_current_page == PAGE_PER_PHY_BLOCK) {
+    139              /* write data in another block */
+    140              next_block = hdi_current_block ^ 1;//即逻辑II块4和5，交替使用
+    141          
+    142              /* erase the block before write bdt */
+    143              ret = UBI_Erase(next_block, next_block);
+    144              if (ret == STATUS_SUCCESS) {
+    145                hdi_current_page = 0;
+    146                hdi_current_block = next_block;
+    147              }
+    148            }
+    149          
+    150            /* write BDT in ram to UBI */
+    151            if (ret == STATUS_SUCCESS) {
+    152              ret = UBI_Write(hdi_current_block, hdi_current_page, hdi_hash_table, NULL,FALSE);
+    153            }
+    154          
+    155            if (ret == STATUS_SUCCESS) {
+    156              PM_NODE_SET_BLOCKPAGE(root_table.hdi_current_journal, hdi_current_block,
+    157                                    hdi_current_page);
+    158              hdi_current_page++;
+    159            }
+    160          
+    161            return ret;
+    162          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+      16   HDI_Commit
+        16   -> UBI_Erase
+        16   -> UBI_Write
+       8   HDI_Format
+         8   -> HDI_Commit
+         8   -> UBI_Erase
+      16   HDI_Init
+        16   -> HDI_Commit
+        16   -> UBI_Read
+      12   HDI_IsHotPage
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable3
+       4  ??DataTable3_1
+       4  ??DataTable3_2
+       4  ??DataTable3_3
+       4  ??DataTable3_4
+     124  HDI_Commit
+      64  HDI_Format
+     136  HDI_Init
+     110  HDI_IsHotPage
+       4  count
+       4  hdi_current_block
+       4  hdi_current_page
+    2048  hdi_hash_table
+
+ 
+ 2 060 bytes in section .bss
+   454 bytes in section .text
+ 
+   454 bytes of CODE memory
+ 2 060 bytes of DATA memory
+
+Errors: none
+Warnings: none

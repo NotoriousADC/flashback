@@ -1,0 +1,423 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\mtd\mtd_api.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\mtd\mtd_api.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\mtd_api.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\mtd_api.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\mtd\mtd_api.c
+      1          /*********************************************************
+      2           * Module name: mtd_api.c
+      3           *
+      4           * Copyright 2010, 2011. All Rights Reserved, Crane Chu.
+      5           *
+      6           * This file is part of OpenNFM.
+      7           *
+      8           * OpenNFM is free software: you can redistribute it and/or 
+      9           * modify it under the terms of the GNU General Public 
+     10           * License as published by the Free Software Foundation, 
+     11           * either version 3 of the License, or (at your option) any 
+     12           * later version.
+     13           * 
+     14           * OpenNFM is distributed in the hope that it will be useful,
+     15           * but WITHOUT ANY WARRANTY; without even the implied 
+     16           * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     17           * PURPOSE. See the GNU General Public License for more 
+     18           * details.
+     19           *
+     20           * You should have received a copy of the GNU General Public 
+     21           * License along with OpenNFM. If not, see 
+     22           * <http://www.gnu.org/licenses/>.
+     23           *
+     24           * First written on 2010-01-01 by cranechu@gmail.com
+     25           *
+     26           * Module Description:
+     27           *    Memory Technology Device. Translate block and
+     28           *    sector offset to physical chip/row/column address.
+     29           *
+     30           *********************************************************/
+     31          
+     32          #include <core\inc\cmn.h>
+     33          #include <core\inc\mtd.h>
+     34          #include <sys\sys.h>
+     35          #include "mtd_nand.h"
+     36          
+     37          UINT32 erase_counts[4096] = {0};
+     38          
+     39          #if (SIM_TEST == FALSE)
+     40          #include "arm_comm.h"
+     41          //extern void Dly_us(Int32U Dly);
+     42          #endif
+     43          
+     44          #define TRANS_PHY_BLOCK(b)             \
+     45          ((((b)&(TOTAL_DIE_COUNT-1))<<BLOCK_PER_PLANE_SHIFT) | \
+     46            ((b)>>TOTAL_DIE_SHIFT))
+     47          #define MTD_REAL_BLOCK(b, p)           \
+     48          (((TRANS_PHY_BLOCK((b)))<<PLANE_PER_DIE_SHIFT)+(p))
+     49          #define MTD_ROW_ADDRESS(block, plane, page)    \
+     50          (((MTD_REAL_BLOCK((block), (plane)))<<PAGE_PER_BLOCK_SHIFT)+(page))
+     51          
+     52          #define MTD_DIE_NUM(b)        ((b)&(DIE_PER_CHIP-1))
+     53          #define MTD_CHIP_NUM(b)       (((b)>>DIE_PER_CHIP_SHIFT)&(CHIP_COUNT-1))
+     54          #define MTD_MAX_RETRY_TIMES   (3)
+     55          
+     56          static STATUS mtd_readstatus(PHY_BLOCK block, UINT8* status_byte);
+     57          
+     58          /* TODO: exploit other NAND feature 
+     59           * - copy back for reclaim, read/write pages in the same plane/die
+     60           * - cache read/write
+     61           * - de-select CE when free
+     62           * - ONFI2/3 ...
+     63           */
+     64          
+     65          void MTD_Init() {
+     66            NAND_Init();
+     67            /* reset all nand chips */
+     68            MTD_Reset();
+     69          }
+     70          
+     71          /* reset all flash chips */
+     72          void MTD_Reset() {
+     73            NAND_CHIP chip;
+     74          
+     75            for (chip = 0; chip < CHIP_COUNT; chip++) {
+     76              NAND_SelectChip(chip);
+     77              NAND_SendCMD(CMD_RESET);
+     78            }
+     79          }
+     80          
+     81          STATUS MTD_ReadID(NAND_CHIP chip, UINT8 id_data[], UINT8 bytes) {
+     82            NAND_COL default_col = 0;
+     83            NAND_ROW default_row = 0;
+     84            STATUS ret = STATUS_SUCCESS;
+     85          
+     86            NAND_SelectChip(chip);
+     87            NAND_SendCMD(CMD_READ_ID);
+     88            /* read ID only need to send one cycle row address */
+     89            NAND_SendAddr(default_col, default_row, 0, 1);
+     90            NAND_ReceiveBytes(id_data, bytes);
+     91          
+     92            return ret;
+     93          }
+     94          
+     95          STATUS MTD_Read(PHY_BLOCK block, PAGE_OFF page, void* buffer, SPARE spare) {
+     96            STATUS ret = STATUS_SUCCESS;
+     97            BOOL ecc_corrected;
+     98            UINT8 ecc_error_count;
+     99            UINT8 retry_times = 0;
+    100            NAND_ROW row_addr = 0;
+    101            NAND_CHIP chip_addr = 0;
+    102          
+    103            /* check status and wait ready of the DIE to read, avoid RWW issue */
+    104            (void) MTD_WaitReady(block);
+    105          
+    106            while (retry_times < MTD_MAX_RETRY_TIMES) {
+    107              if (ret == STATUS_SUCCESS) {
+    108                row_addr = (NAND_ROW) MTD_ROW_ADDRESS(block, 0, page);
+    109                chip_addr = (NAND_CHIP) MTD_CHIP_NUM(block);
+    110          
+    111                /* select and check ready */
+    112                NAND_SelectChip(chip_addr);
+    113                NAND_SendCMD(CMD_READ);
+    114                NAND_SendAddr(0, row_addr, CFG_NAND_COL_CYCLE, CFG_NAND_ROW_CYCLE);
+    115                NAND_SendCMD(CMD_READ_COMMIT);
+    116                NAND_WaitRB(chip_addr);
+    117              }
+    118          
+    119              if (ret == STATUS_SUCCESS) {
+    120                /* receive page data */
+    121                ret = NAND_ReceiveData(buffer, spare);
+    122                if (ret != STATUS_SUCCESS) {
+    123                  /* TODO: check ecc handler algo */
+    124                  ecc_corrected = NAND_ECCStatus(&ecc_error_count);
+    125                  if (ecc_corrected == TRUE) {
+    126                    /* error is corrected */
+    127                    ret = STATUS_SUCCESS;
+    128                  } else {
+    129                    /* un-correctable, re-try before report error */
+    130                    ret = STATUS_FAILURE;
+    131                    break;
+    132                  }
+    133                }
+    134          
+    135                /* send next page in MPP */
+    136                if (buffer != NULL) {
+    137                  buffer = ((UINT8*) buffer) + PAGE_SIZE;
+    138                }
+    139              }
+    140          
+    141              if (ret == STATUS_FAILURE && retry_times < MTD_MAX_RETRY_TIMES - 1) {
+    142                /* try again */
+    143                retry_times++;
+    144                ret = STATUS_SUCCESS;
+    145                continue;
+    146              } else {
+    147                break;
+    148              }
+    149            }
+    150          
+    151            return ret;
+    152          }
+    153          
+    154          STATUS MTD_Program(PHY_BLOCK block, PAGE_OFF page, void* buffer, SPARE spare) {
+    155            NAND_ROW row_addr;
+    156            NAND_CHIP chip_addr;
+    157            STATUS ret = STATUS_SUCCESS;
+    158          
+    159            row_addr = (NAND_ROW) MTD_ROW_ADDRESS(block, 0, page);
+    160            chip_addr = (NAND_CHIP) MTD_CHIP_NUM(block);
+    161          
+    162            NAND_SelectChip(chip_addr);
+    163            NAND_SendCMD(CMD_PAGE_PROGRAM);
+    164            NAND_SendAddr(0, row_addr, CFG_NAND_COL_CYCLE, CFG_NAND_ROW_CYCLE);
+    165            NAND_SendData(buffer, spare);
+    166          
+    167            /* commit the whole write, multi-plane or one-plane write */
+    168            NAND_SendCMD(CMD_PAGE_PROGRAM_COMMIT);
+    169          
+    170            return ret;
+    171          }
+    172          
+    173          STATUS MTD_Erase(PHY_BLOCK block) {
+    174            NAND_ROW row_addr;
+    175            NAND_CHIP chip_addr = INVALID_CHIP;
+    176            UINT8 retry_times = 0;
+    177            STATUS ret = STATUS_SUCCESS;
+    178            
+    179            //Only apply if the block is good. We don't care about bad block erases.
+    180            if(~(erase_counts[block]))
+    181              erase_counts[block]++;
+    182          
+    183            while (retry_times < MTD_MAX_RETRY_TIMES) {
+    184              row_addr = (NAND_ROW) MTD_ROW_ADDRESS(block, 0, 0);
+    185              chip_addr = (NAND_CHIP) MTD_CHIP_NUM(block);
+    186          
+    187              NAND_SelectChip(chip_addr);
+    188              NAND_SendCMD(CMD_BLOCK_ERASE);
+    189              NAND_SendAddr(0, row_addr, 0, CFG_NAND_ROW_CYCLE);
+    190              NAND_SendCMD(CMD_BLOCK_ERASE_COMMIT);
+    191          
+    192              ASSERT(chip_addr != INVALID_CHIP);
+    193              NAND_WaitRB(chip_addr);
+    194          
+    195              /* check status */
+    196              ret = MTD_ReadStatus(block);
+    197              if (ret != STATUS_SUCCESS) {
+    198                /* try again */
+    199                retry_times++;
+    200                continue;
+    201              } else {
+    202                break;
+    203              }
+    204            }
+    205          
+    206            return ret;
+    207          }
+    208          
+    209          STATUS MTD_CheckBlock(PHY_BLOCK block) {
+    210            UINT8 read_byte;
+    211            NAND_ROW row_addr = MAX_UINT8;
+    212            NAND_CHIP chip_addr;
+    213            PAGE_OFF page;
+    214            STATUS ret = STATUS_SUCCESS;
+    215          
+    216            /* only check the bad block byte in the first 2 pages */
+    217            for (page = 0; page < 2; page++) {
+    218              if (ret == STATUS_SUCCESS) {
+    219                row_addr = (NAND_ROW) MTD_ROW_ADDRESS(block, 0, 0);
+    220                chip_addr = (NAND_CHIP) MTD_CHIP_NUM(block);
+    221          
+    222                /* read the page */
+    223                NAND_SelectChip(chip_addr);
+    224                NAND_SendCMD(CMD_READ);
+    225                NAND_SendAddr(0, row_addr, CFG_NAND_COL_CYCLE, CFG_NAND_ROW_CYCLE);
+    226                NAND_SendCMD(CMD_READ_COMMIT);
+    227          
+    228                /* wait on read data ready */
+    229                NAND_WaitRB(chip_addr);
+    230              }
+    231          
+    232              if (ret == STATUS_SUCCESS) {
+    233                ASSERT(row_addr != MAX_UINT8);
+    234          
+    235                /* read the first byte in spare area */
+    236                NAND_SendCMD(CMD_RANDOM_DATA_OUT);
+    237                NAND_SendAddr(PAGE_SIZE, row_addr, CFG_NAND_COL_CYCLE, 0);
+    238                NAND_SendCMD(CMD_RANDOM_DATA_OUT_COMMIT);
+    239          
+    240                /* only read one byte */
+    241                NAND_ReceiveBytes(&read_byte, 1);
+    242          
+    243                if (read_byte != 0xff) {
+    244                  /* this block is marked as BAD block */
+    245                  ret = STATUS_BADBLOCK;
+    246                }
+    247              }
+    248            }
+    249          
+    250            return ret;
+    251          }
+    252          
+    253          STATUS MTD_ReadStatus(PHY_BLOCK block) {
+    254            UINT8 status_byte;
+    255            STATUS ret = STATUS_SUCCESS;
+    256          
+    257            /* sort the block in die interleave way */
+    258            ASSERT(block < CFG_LOG_BLOCK_COUNT);
+    259          
+    260            ret = mtd_readstatus(block, &status_byte);
+    261            if (ret == STATUS_SUCCESS) {
+    262              if (NAND_STATUS_BUSY(status_byte) == TRUE) {
+    263                ret = STATUS_DIE_BUSY;
+    264              } else if (NAND_STATUS_FAIL(status_byte) == TRUE) {
+    265                ret = STATUS_BADBLOCK;
+    266              } else {
+    267                ret = STATUS_SUCCESS;
+    268              }
+    269            }
+    270          
+    271            return ret;
+    272          }
+    273          
+    274          STATUS MTD_WaitReady(PHY_BLOCK block) {
+    275            STATUS ret;
+    276          
+    277            /* sort the block in die interleave way */
+    278            ASSERT(block < CFG_LOG_BLOCK_COUNT);
+    279          
+    280            do {
+    281              ret = MTD_ReadStatus(block);
+    282            } while (ret == STATUS_DIE_BUSY);
+    283          
+    284            return ret;
+    285          }
+    286          
+    287          static STATUS mtd_readstatus(PHY_BLOCK block, UINT8* status_byte) {
+    288            NAND_CHIP chip_addr;
+    289            NAND_CMD die_status;
+    290            STATUS ret = STATUS_SUCCESS;
+    291          
+    292            if (ret == STATUS_SUCCESS) {
+    293              chip_addr = (NAND_CHIP) MTD_CHIP_NUM(block);
+    294          #if (DIE_PER_CHIP_SHIFT == 0)
+    295              /* single die */
+    296              die_status = CMD_READ_STATUS;
+    297          #else
+    298              /* dual die in one ce, different cmd to poll status */
+    299              if (MTD_DIE_NUM(block) == 0)
+    300              {
+    301                die_status = CMD_READ_STATUS_DIE1;
+    302              }
+    303              else
+    304              {
+    305                die_status = CMD_READ_STATUS_DIE2;
+    306              }
+    307          #endif
+    308          
+    309              NAND_SelectChip(chip_addr);
+    310              NAND_SendCMD(die_status);
+    311          
+    312              NAND_ReceiveBytes(status_byte, 1);
+    313            }
+    314          
+    315            return ret;
+    316          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+      32   MTD_CheckBlock
+        32   -> NAND_ReceiveBytes
+        32   -> NAND_SelectChip
+        32   -> NAND_SendAddr
+        32   -> NAND_SendCMD
+        32   -> NAND_WaitRB
+      24   MTD_Erase
+        24   -> MTD_ReadStatus
+        24   -> NAND_SelectChip
+        24   -> NAND_SendAddr
+        24   -> NAND_SendCMD
+        24   -> NAND_WaitRB
+       8   MTD_Init
+         8   -> MTD_Reset
+         8   -> NAND_Init
+      24   MTD_Program
+        24   -> NAND_SelectChip
+        24   -> NAND_SendAddr
+        24   -> NAND_SendCMD
+        24   -> NAND_SendData
+      40   MTD_Read
+        40   -> MTD_WaitReady
+        40   -> NAND_ECCStatus
+        40   -> NAND_ReceiveData
+        40   -> NAND_SelectChip
+        40   -> NAND_SendAddr
+        40   -> NAND_SendCMD
+        40   -> NAND_WaitRB
+      24   MTD_ReadID
+        24   -> NAND_ReceiveBytes
+        24   -> NAND_SelectChip
+        24   -> NAND_SendAddr
+        24   -> NAND_SendCMD
+       8   MTD_ReadStatus
+         8   -> mtd_readstatus
+       8   MTD_Reset
+         8   -> NAND_SelectChip
+         8   -> NAND_SendCMD
+       8   MTD_WaitReady
+         8   -> MTD_ReadStatus
+      16   mtd_readstatus
+        16   -> NAND_ReceiveBytes
+        16   -> NAND_SelectChip
+        16   -> NAND_SendCMD
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable0
+     140  MTD_CheckBlock
+     130  MTD_Erase
+      12  MTD_Init
+      62  MTD_Program
+     178  MTD_Read
+      60  MTD_ReadID
+      62  MTD_ReadStatus
+      34  MTD_Reset
+      32  MTD_WaitReady
+   16384  erase_counts
+      52  mtd_readstatus
+
+ 
+ 16 384 bytes in section .bss
+    766 bytes in section .text
+ 
+    766 bytes of CODE memory
+ 16 384 bytes of DATA memory
+
+Errors: none
+Warnings: none

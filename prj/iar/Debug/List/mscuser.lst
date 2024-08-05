@@ -1,0 +1,1019 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\sys\lpc313x\usb\mscuser.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\sys\lpc313x\usb\mscuser.c -D
+#        BOOT_LEVEL_2 -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List
+#        -o C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\mscuser.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\mscuser.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\sys\lpc313x\usb\mscuser.c
+      1          /*--------------------------------------------------------------------------
+      2           * U S B  -  K e r n e l
+      3           *--------------------------------------------------------------------------
+      4           * Name:    mscuser.c
+      5           * Purpose: Mass Storage Class Custom User Module
+      6           * Version: V1.20
+      7           *--------------------------------------------------------------------------
+      8           * This software is supplied "AS IS" without any warranties, express,
+      9           * implied or statutory, including but not limited to the implied
+     10           * warranties of fitness for purpose, satisfactory quality and
+     11           * noninfringement. Keil extends you a royalty-free right to reproduce
+     12           * and distribute executable files created using this software for use
+     13           * on NXP ARM microcontroller devices only. Nothing else gives
+     14           * you the right to use this software.
+     15           *
+     16           * Copyright (c) 2008 Keil - An ARM Crane Chu. All rights reserved.
+     17           * Adaption to LPCxxxx, Copyright (c) 2009 NXP.
+     18           *--------------------------------------------------------------------------
+     19           * History:
+     20           *          V1.20 Added SCSI_READ12, SCSI_WRITE12
+     21           *          V1.00 Initial Version
+     22           *--------------------------------------------------------------------------*/
+     23          
+     24          #include "lpc_usb.h"
+     25          #include "msc.h"
+     26          #include "usbcfg.h"
+     27          #include "usbhw.h"
+     28          #include "usbcore.h"
+     29          #include "mscuser.h"
+     30          
+     31          #include "drv_uart.h"
+     32          
+     33          #include <string.h>
+     34          
+     35          #include <onfm.h>
+     36          
+     37          #include <core\inc\buf.h>
+     38          
+     39          
+     40          extern UNS_32 DevStatusFS2HS;
+     41          
+     42          UNS_32   MemOK;                        /* Memory OK */
+     43          
+     44          UNS_32   Offset;                       /* R/W SECTOR Offset */
+     45          UNS_32   Length;                       /* R/W SECTOR Length */
+     46          
+     47          UNS_8*   BulkBuf;                      /* Bulk Out Buffer */
+     48          
+     49          UNS_32   BulkLen;                      /* Bulk In/Out Length */
+     50          UNS_32   MSC_BlockCount;               /* block count in the volumn image */
+     51          
+     52          UNS_32   Read_BulkLen;
+     53          
+     54          #pragma data_alignment=DMA_BURST_BYTES
+     55          UNS_8    Read_BulkBuf[MPP_SIZE];  /* Bulk In Buffer */
+     56          #pragma data_alignment=DMA_BURST_BYTES
+     57          UNS_8    CMD_BulkBuf[MSC_BlockSize];   /* Bulk In Buffer for commands */
+     58          #pragma data_alignment=DMA_BURST_BYTES
+     59          MSC_CBW  CBW;                          /* Command Block Wrapper */
+     60          #pragma data_alignment=DMA_BURST_BYTES
+     61          MSC_CSW  CSW;                          /* Command Status Wrapper */
+     62          
+     63          UNS_8    BulkStage;                    /* Bulk Stage */
+     64          
+     65          /* usb transaction list: move write operations to user space */
+     66          USB_TRANSCATION  ut_list[UT_LIST_SIZE];
+     67          volatile UNS_32  ut_pop;
+     68          volatile UNS_32  ut_push;
+     69          
+     70          MERGE_STAGE    merge_stage;
+     71          UNS_32         merge_count;
+     72          
+     73          static UNS_32 DataIn_Format(void);
+     74          static void DataIn_Transfer(void);
+     75          
+     76          
+     77          void MSC_Init()
+     78          {
+     79             /* allocate memory before 1st bulk */
+     80             BulkBuf = NULL;
+     81             Read_BulkLen = 0;
+     82             merge_stage = MERGE_NONE;
+     83             merge_count = 0;
+     84          
+     85             /* init the ut_list */
+     86             ut_pop = 0;
+     87             ut_push = 0;
+     88          
+     89             MSC_BlockCount = ONFM_Capacity();
+     90          }
+     91          
+     92          
+     93          void MSC_SetStallEP (UNS_32 EPNum)            /* set EP halt status according stall status */
+     94          {
+     95             USB_SetStallEP(EPNum);
+     96             USB_EndPointHalt  |=  (EPNum & 0x80) ? ((1 << 16) << (EPNum & 0x0F)) : (1 << EPNum);
+     97          }
+     98          
+     99          
+    100          UNS_32 MSC_Reset(void)
+    101          {
+    102             USB_EndPointStall = 0x00000000;          /* EP must stay stalled */
+    103             CSW.dSignature = 0;                      /* invalid signature */
+    104          
+    105             BulkStage = MSC_BS_CBW;
+    106             return (TRUE);
+    107          }
+    108          
+    109          
+    110          UNS_32 MSC_GetMaxLUN(void)
+    111          {
+    112             EP0Buf[0] = 0;               /* No LUN associated with this device */
+    113             return (TRUE);
+    114          }
+    115          
+    116          
+    117          void MSC_MemoryRead(void)
+    118          {
+    119             UNS_32   n;    /* sector count */
+    120             int      onfm_ret = 0;
+    121          
+    122             if (DevStatusFS2HS)
+    123             {
+    124                /* read sectors aligned to a MPP */
+    125                n = MIN(SECTOR_PER_MPP-(Offset%SECTOR_PER_MPP), Length);
+    126          
+    127                if ((Offset + n) > MSC_BlockCount)
+    128                {
+    129                   n = MSC_BlockCount - Offset;
+    130                   BulkStage = MSC_BS_DATA_IN_LAST_STALL;
+    131                }
+    132             }
+    133             else
+    134             {
+    135                onfm_ret = -1;
+    136                n = 0;
+    137             }
+    138          
+    139             if (onfm_ret == 0)
+    140             {
+    141                /* log the read operation to ut_list */
+    142                ut_list[ut_push].type   = UT_READ;
+    143                ut_list[ut_push].offset = Offset;
+    144                ut_list[ut_push].length = n;
+    145                ut_list[ut_push].buffer = Read_BulkBuf;
+    146          
+    147                /* handle ONFM read/write in user tasks */
+    148                ut_push = (ut_push+1)%UT_LIST_SIZE;
+    149                /* the ut_list should not be full */
+    150                ASSERT(ut_push != ut_pop);
+    151          
+    152                Read_BulkLen = 0;
+    153          
+    154                Offset += n;
+    155                Length -= n;
+    156          
+    157                CSW.dDataResidue -= (n*MSC_BlockSize);
+    158             }
+    159          }
+    160          
+    161          void MSC_MemoryWrite(void)
+    162          {
+    163             UNS_32   n;    /* sector count */
+    164          
+    165             /* BulkLen should be align to sector size */
+    166             if (BulkLen%MSC_BlockSize == 0)
+    167             {
+    168                n = BulkLen/MSC_BlockSize;
+    169          
+    170                if ((Offset + n) > MSC_BlockCount)
+    171                {
+    172                   BulkLen = (MSC_BlockCount - Offset)*MSC_BlockSize;
+    173                   BulkStage = MSC_BS_CSW;
+    174                   MSC_SetStallEP(MSC_EP_OUT);
+    175                }
+    176          
+    177                /* log the write operation to ut_list */
+    178                ut_list[ut_push].type   = UT_WRITE;
+    179                ut_list[ut_push].offset = Offset&(~(SECTOR_PER_MPP-1));
+    180                ut_list[ut_push].length = SECTOR_PER_MPP;
+    181                ut_list[ut_push].buffer = BulkBuf;
+    182          
+    183                /* handle ONFM read/write in user tasks */
+    184                ut_push = (ut_push+1)%UT_LIST_SIZE;
+    185                /* the ut_list should not be full */
+    186                ASSERT(ut_push != ut_pop);
+    187          
+    188                Offset += n;
+    189                Length -= n;
+    190                CSW.dDataResidue -= BulkLen;
+    191          
+    192                if ((Length == 0) || (BulkStage == MSC_BS_CSW))
+    193                {
+    194                   CSW.bStatus = CSW_CMD_PASSED;
+    195                   MSC_SetCSW();
+    196                }
+    197             }
+    198          }
+    199          
+    200          
+    201          void MSC_MemoryVerify(void)
+    202          {
+    203             Offset += Length;
+    204             Length = 0;
+    205          
+    206             CSW.dDataResidue = 0;
+    207             CSW.bStatus = CSW_CMD_PASSED;
+    208          
+    209             MSC_SetCSW();
+    210          }
+    211          
+    212          
+    213          UNS_32 MSC_RWSetup(void)
+    214          {
+    215             UNS_32 n;
+    216          
+    217             /* Logical Block Address of First Block */
+    218             n = (CBW.CB[2] << 24) |
+    219                 (CBW.CB[3] << 16) |
+    220                 (CBW.CB[4] <<  8) |
+    221                 (CBW.CB[5] <<  0);
+    222          
+    223             Offset = n;
+    224          
+    225             /* Number of Blocks to transfer */
+    226             switch (CBW.CB[0])
+    227             {
+    228                case SCSI_READ10:
+    229                case SCSI_WRITE10:
+    230                case SCSI_VERIFY10:
+    231                   n = (CBW.CB[7] <<  8) |
+    232                       (CBW.CB[8] <<  0);
+    233                   break;
+    234          
+    235                case SCSI_READ12:
+    236                case SCSI_WRITE12:
+    237                   n = (CBW.CB[6] << 24) |
+    238                       (CBW.CB[7] << 16) |
+    239                       (CBW.CB[8] <<  8) |
+    240                       (CBW.CB[9] <<  0);
+    241                   break;
+    242             }
+    243          
+    244             Length = n;
+    245          
+    246             if (CBW.dDataLength == 0)                /* host requests no data */
+    247             {
+    248                CSW.bStatus = CSW_CMD_FAILED;
+    249                MSC_SetCSW();
+    250                return (FALSE);
+    251             }
+    252          
+    253             if (CBW.dDataLength != (n*MSC_BlockSize))
+    254             {
+    255                if ((CBW.bmFlags & 0x80) != 0)         /* stall appropriate EP */
+    256                {
+    257                   MSC_SetStallEP(MSC_EP_IN);
+    258                }
+    259                else
+    260                {
+    261                   MSC_SetStallEP(MSC_EP_OUT);
+    262                }
+    263          
+    264                CSW.bStatus = CSW_CMD_FAILED;
+    265                MSC_SetCSW();
+    266          
+    267                return (FALSE);
+    268             }
+    269          
+    270             return (TRUE);
+    271          }
+    272          
+    273          
+    274          void MSC_TestUnitReady(void)
+    275          {
+    276          
+    277             if (CBW.dDataLength != 0)
+    278             {
+    279                if ((CBW.bmFlags & 0x80) != 0)
+    280                {
+    281                   MSC_SetStallEP(MSC_EP_IN);
+    282                }
+    283                else
+    284                {
+    285                   MSC_SetStallEP(MSC_EP_OUT);
+    286                }
+    287             }
+    288          
+    289             CSW.bStatus = CSW_CMD_PASSED;
+    290             MSC_SetCSW();
+    291          }
+    292          
+    293          
+    294          void MSC_RequestSense (void)
+    295          {
+    296             if (!DataIn_Format()) return;
+    297          
+    298             CMD_BulkBuf[ 0] = 0x70;          /* Response Code */
+    299             CMD_BulkBuf[ 1] = 0x00;
+    300             CMD_BulkBuf[ 2] = 0x02;          /* Sense Key */
+    301             CMD_BulkBuf[ 3] = 0x00;
+    302             CMD_BulkBuf[ 4] = 0x00;
+    303             CMD_BulkBuf[ 5] = 0x00;
+    304             CMD_BulkBuf[ 6] = 0x00;
+    305             CMD_BulkBuf[ 7] = 0x0A;          /* Additional Length */
+    306             CMD_BulkBuf[ 8] = 0x00;
+    307             CMD_BulkBuf[ 9] = 0x00;
+    308             CMD_BulkBuf[10] = 0x00;
+    309             CMD_BulkBuf[11] = 0x00;
+    310             CMD_BulkBuf[12] = 0x30;          /* ASC */
+    311             CMD_BulkBuf[13] = 0x01;          /* ASCQ */
+    312             CMD_BulkBuf[14] = 0x00;
+    313             CMD_BulkBuf[15] = 0x00;
+    314             CMD_BulkBuf[16] = 0x00;
+    315             CMD_BulkBuf[17] = 0x00;
+    316          
+    317             BulkLen = 18;
+    318             DataIn_Transfer();
+    319          }
+    320          
+    321          
+    322          void MSC_Inquiry(void)
+    323          {
+    324             if (!DataIn_Format()) return;
+    325          
+    326             CMD_BulkBuf[ 0] = 0x00;          /* Direct Access Device */
+    327             CMD_BulkBuf[ 1] = 0x80;          /* RMB = 1: Removable Medium */
+    328             CMD_BulkBuf[ 2] = 0x00;          /* Version: No conformance claim to standard */
+    329             CMD_BulkBuf[ 3] = 0x01;
+    330          
+    331             CMD_BulkBuf[ 4] = 36 - 4;        /* Additional Length */
+    332             CMD_BulkBuf[ 5] = 0x80;          /* SCCS = 1: Storage Controller Component */
+    333             CMD_BulkBuf[ 6] = 0x00;
+    334             CMD_BulkBuf[ 7] = 0x00;
+    335          
+    336             CMD_BulkBuf[ 8] = 'C';           /* Vendor Identification */
+    337             CMD_BulkBuf[ 9] = 'r';
+    338             CMD_BulkBuf[10] = 'a';
+    339             CMD_BulkBuf[11] = 'n';
+    340             CMD_BulkBuf[12] = 'e';
+    341             CMD_BulkBuf[13] = '5';
+    342             CMD_BulkBuf[14] = '4';
+    343             CMD_BulkBuf[15] = '4';
+    344          
+    345             CMD_BulkBuf[16] = 'O';           /* Product Identification */
+    346             CMD_BulkBuf[17] = 'p';
+    347             CMD_BulkBuf[18] = 'e';
+    348             CMD_BulkBuf[19] = 'n';
+    349             CMD_BulkBuf[20] = ' ';
+    350             CMD_BulkBuf[21] = 'N';
+    351             CMD_BulkBuf[22] = 'A';
+    352             CMD_BulkBuf[23] = 'N';
+    353             CMD_BulkBuf[24] = 'D';
+    354             CMD_BulkBuf[25] = 'F';
+    355             CMD_BulkBuf[26] = ' ';
+    356             CMD_BulkBuf[27] = 'M';
+    357             CMD_BulkBuf[28] = 'g';
+    358             CMD_BulkBuf[29] = 'r';
+    359             CMD_BulkBuf[30] = ' ';
+    360             CMD_BulkBuf[31] = ' ';
+    361          
+    362             CMD_BulkBuf[32] = '0';           /* Product Revision Level */
+    363             CMD_BulkBuf[33] = '.';
+    364             CMD_BulkBuf[34] = '1';
+    365             CMD_BulkBuf[35] = ' ';
+    366          
+    367             BulkLen = 36;
+    368             DataIn_Transfer();
+    369          }
+    370          
+    371          
+    372          void MSC_ModeSense6(void)
+    373          {
+    374             if (!DataIn_Format()) return;
+    375          
+    376             CMD_BulkBuf[ 0] = 0x03;
+    377             CMD_BulkBuf[ 1] = 0x00;
+    378             CMD_BulkBuf[ 2] = 0x00;
+    379             CMD_BulkBuf[ 3] = 0x00;
+    380          
+    381             BulkLen = 4;
+    382             DataIn_Transfer();
+    383          }
+    384          
+    385          
+    386          void MSC_ModeSense10(void)
+    387          {
+    388             if (!DataIn_Format()) return;
+    389          
+    390             CMD_BulkBuf[ 0] = 0x00;
+    391             CMD_BulkBuf[ 1] = 0x06;
+    392             CMD_BulkBuf[ 2] = 0x00;
+    393             CMD_BulkBuf[ 3] = 0x00;
+    394             CMD_BulkBuf[ 4] = 0x00;
+    395             CMD_BulkBuf[ 5] = 0x00;
+    396             CMD_BulkBuf[ 6] = 0x00;
+    397             CMD_BulkBuf[ 7] = 0x00;
+    398          
+    399             BulkLen = 8;
+    400             DataIn_Transfer();
+    401          }
+    402          
+    403          
+    404          void MSC_ReadCapacity(void)
+    405          {
+    406          
+    407             if (!DataIn_Format()) return;
+    408          
+    409             /* Last Logical Block */
+    410             CMD_BulkBuf[ 0] = ((MSC_BlockCount - 1) >> 24) & 0xFF;
+    411             CMD_BulkBuf[ 1] = ((MSC_BlockCount - 1) >> 16) & 0xFF;
+    412             CMD_BulkBuf[ 2] = ((MSC_BlockCount - 1) >>  8) & 0xFF;
+    413             CMD_BulkBuf[ 3] = ((MSC_BlockCount - 1) >>  0) & 0xFF;
+    414          
+    415             /* Block Length */
+    416             CMD_BulkBuf[ 4] = (MSC_BlockSize >> 24) & 0xFF;
+    417             CMD_BulkBuf[ 5] = (MSC_BlockSize >> 16) & 0xFF;
+    418             CMD_BulkBuf[ 6] = (MSC_BlockSize >>  8) & 0xFF;
+    419             CMD_BulkBuf[ 7] = (MSC_BlockSize >>  0) & 0xFF;
+    420          
+    421             BulkLen = 8;
+    422             DataIn_Transfer();
+    423          }
+    424          
+    425          
+    426          void MSC_ReadFormatCapacity(void)
+    427          {
+    428             if (!DataIn_Format()) return;
+    429          
+    430             CMD_BulkBuf[ 0] = 0x00;
+    431             CMD_BulkBuf[ 1] = 0x00;
+    432             CMD_BulkBuf[ 2] = 0x00;
+    433             CMD_BulkBuf[ 3] = 0x08;          /* Capacity List Length */
+    434          
+    435             /* Block Count */
+    436             CMD_BulkBuf[ 4] = (MSC_BlockCount >> 24) & 0xFF;
+    437             CMD_BulkBuf[ 5] = (MSC_BlockCount >> 16) & 0xFF;
+    438             CMD_BulkBuf[ 6] = (MSC_BlockCount >>  8) & 0xFF;
+    439             CMD_BulkBuf[ 7] = (MSC_BlockCount >>  0) & 0xFF;
+    440          
+    441             /* Block Length */
+    442             CMD_BulkBuf[ 8] = 0x02;          /* Descriptor Code: Formatted Media */
+    443             CMD_BulkBuf[ 9] = (MSC_BlockSize >> 16) & 0xFF;
+    444             CMD_BulkBuf[10] = (MSC_BlockSize >>  8) & 0xFF;
+    445             CMD_BulkBuf[11] = (MSC_BlockSize >>  0) & 0xFF;
+    446          
+    447             BulkLen = 12;
+    448             DataIn_Transfer();
+    449          }
+    450          
+    451          
+    452          void MSC_GetCBW(void)
+    453          {
+    454             if ((BulkLen == sizeof(CBW)) && (CBW.dSignature == MSC_CBW_Signature))
+    455             {
+    456                /* Valid CBW */
+    457                CSW.dTag = CBW.dTag;
+    458                CSW.dDataResidue = CBW.dDataLength;
+    459                if ((CBW.bLUN != 0)     ||
+    460                    (CBW.bCBLength < 1) ||
+    461                    (CBW.bCBLength > 16) )
+    462                {
+    463          fail:
+    464                   CSW.bStatus = CSW_CMD_FAILED;
+    465                   MSC_SetCSW();
+    466                }
+    467                else
+    468                {
+    469                   switch (CBW.CB[0])
+    470                   {
+    471                      case SCSI_TEST_UNIT_READY:
+    472                         MSC_TestUnitReady();
+    473                         break;
+    474                      case SCSI_REQUEST_SENSE:
+    475                         MSC_RequestSense();
+    476                         break;
+    477                      case SCSI_FORMAT_UNIT:
+    478                         goto fail;
+    479                      case SCSI_INQUIRY:
+    480                         MSC_Inquiry();
+    481                         break;
+    482                      case SCSI_START_STOP_UNIT:
+    483                         goto fail;
+    484                      case SCSI_MEDIA_REMOVAL:
+    485                         goto fail;
+    486                      case SCSI_MODE_SELECT6:
+    487                         goto fail;
+    488                      case SCSI_MODE_SENSE6:
+    489                         MSC_ModeSense6();
+    490                         break;
+    491                      case SCSI_MODE_SELECT10:
+    492                         goto fail;
+    493                      case SCSI_MODE_SENSE10:
+    494                         MSC_ModeSense10();
+    495                         break;
+    496                      case SCSI_READ_FORMAT_CAPACITIES:
+    497                         MSC_ReadFormatCapacity();
+    498                         break;
+    499                      case SCSI_READ_CAPACITY:
+    500                         MSC_ReadCapacity();
+    501                         break;
+    502                      case SCSI_READ10:
+    503                      case SCSI_READ12:
+    504                         if (MSC_RWSetup())
+    505                         {
+    506                            if ((CBW.bmFlags & 0x80) != 0)
+    507                            {
+    508                               BulkStage = MSC_BS_DATA_IN;
+    509                               MSC_MemoryRead();
+    510                            }
+    511                            else
+    512                            {
+    513                               MSC_SetStallEP(MSC_EP_OUT);
+    514                               CSW.bStatus = CSW_PHASE_ERROR;
+    515                               MSC_SetCSW();
+    516                            }
+    517                         }
+    518                         break;
+    519                      case SCSI_WRITE10:
+    520                      case SCSI_WRITE12:
+    521                         if (MSC_RWSetup())
+    522                         {
+    523                            if ((CBW.bmFlags & 0x80) == 0)
+    524                            {
+    525                               BulkStage = MSC_BS_DATA_OUT;
+    526                            }
+    527                            else
+    528                            {
+    529                               MSC_SetStallEP(MSC_EP_IN);
+    530                               CSW.bStatus = CSW_PHASE_ERROR;
+    531                               MSC_SetCSW();
+    532                            }
+    533                         }
+    534                         break;
+    535                      case SCSI_VERIFY10:
+    536                         if ((CBW.CB[1] & 0x02) == 0)
+    537                         {
+    538                            // BYTCHK = 0 -> CRC Check (not implemented)
+    539                            CSW.bStatus = CSW_CMD_PASSED;
+    540                            MSC_SetCSW();
+    541                            break;
+    542                         }
+    543          
+    544                         if (MSC_RWSetup())
+    545                         {
+    546                            if ((CBW.bmFlags & 0x80) == 0)
+    547                            {
+    548                               BulkStage = MSC_BS_DATA_OUT;
+    549                               MemOK = TRUE;
+    550                            }
+    551                            else
+    552                            {
+    553                               MSC_SetStallEP(MSC_EP_IN);
+    554                               CSW.bStatus = CSW_PHASE_ERROR;
+    555                               MSC_SetCSW();
+    556                            }
+    557                         }
+    558                         break;
+    559                      default:
+    560                         goto fail;
+    561                   }
+    562                }
+    563             }
+    564             else
+    565             {
+    566                /* Invalid CBW */
+    567                MSC_SetStallEP(MSC_EP_IN);
+    568                /* set EP to stay stalled */
+    569                USB_EndPointStall |=  (1 << (16 + (MSC_EP_IN  & 0x0F)));
+    570                MSC_SetStallEP(MSC_EP_OUT);
+    571                /* set EP to stay stalled */
+    572                USB_EndPointStall |=  (1 << MSC_EP_OUT);
+    573                BulkStage = MSC_BS_ERROR;
+    574             }
+    575          }
+    576          
+    577          
+    578          void MSC_SetCSW(void)
+    579          {
+    580             CSW.dSignature = MSC_CSW_Signature;
+    581             USB_WriteEP(MSC_EP_IN, (UNS_8 *)&CSW, sizeof(CSW));
+    582             BulkStage = MSC_BS_CSW;
+    583          }
+    584          
+    585          
+    586          void MSC_BulkInNak(void)
+    587          {
+    588             if (Read_BulkLen != 0)
+    589             {
+    590                /* read buffer is ready to prime */
+    591                USB_WriteEP(MSC_EP_IN, Read_BulkBuf, Read_BulkLen);
+    592          
+    593                if (Length == 0)
+    594                {
+    595                   BulkStage = MSC_BS_DATA_IN_LAST;
+    596                }
+    597          
+    598                if (BulkStage != MSC_BS_DATA_IN)
+    599                {
+    600                   CSW.bStatus = CSW_CMD_PASSED;
+    601                }
+    602          
+    603                /* TODO: pre-read the next page.
+    604                 * - log pre-read to the task list
+    605                 * - ONFM read the page out, when USB is sending the current page
+    606                 * - ONFM check the pre-read buffer before read it from NAND
+    607                 * - ONFM return the address of buffer, avoid another copying. 
+    608                 */
+    609             }
+    610          }
+    611          
+    612          
+    613          void MSC_BulkIn(void)
+    614          {
+    615             switch (BulkStage)
+    616             {
+    617                case MSC_BS_DATA_IN:
+    618                   switch (CBW.CB[0])
+    619                   {
+    620                      case SCSI_READ10:
+    621                      case SCSI_READ12:
+    622                         MSC_MemoryRead();
+    623                         break;
+    624                   }
+    625                   break;
+    626                case MSC_BS_DATA_IN_LAST:
+    627                   MSC_SetCSW();
+    628                   break;
+    629                case MSC_BS_DATA_IN_LAST_STALL:
+    630                   MSC_SetStallEP(MSC_EP_IN);
+    631                   MSC_SetCSW();
+    632                   break;
+    633                case MSC_BS_CSW:
+    634                   BulkStage = MSC_BS_CBW;
+    635                   break;
+    636             }
+    637          }
+    638          
+    639          
+    640          void MSC_BulkOutNak(void)
+    641          {
+    642             UNS_32   n;
+    643             UNS_32   bulkout_len;
+    644             void*    buffer = NULL;
+    645          
+    646             if (DevStatusFS2HS)
+    647             {
+    648                if (BulkStage == MSC_BS_DATA_OUT)
+    649                {
+    650                   if (merge_stage == MERGE_START)
+    651                   {
+    652                      /* not prime before get merged data */
+    653                      buffer = NULL;
+    654                      bulkout_len = 0;
+    655                   }
+    656                   else if (merge_stage == MERGE_FINISH)
+    657                   {
+    658                      buffer = BulkBuf+(Offset%SECTOR_PER_MPP)*MSC_BlockSize;
+    659                      bulkout_len = merge_count*MSC_BlockSize;
+    660          
+    661                      merge_stage = MERGE_NONE;
+    662                      merge_count = 0;
+    663                   }
+    664                   else
+    665                   {
+    666                      ASSERT(merge_stage == MERGE_NONE);
+    667          
+    668                      /* try to allocate buffer for next bulk */
+    669                      BulkBuf = BUF_Allocate();
+    670                      if (BulkBuf != NULL)
+    671                      {
+    672                         /* sector counts to write in MPP aligned */
+    673                         n = MIN(SECTOR_PER_MPP-(Offset%SECTOR_PER_MPP), Length);
+    674          
+    675                         /* merge non-aligned or non-full bulk */
+    676                         if (n != SECTOR_PER_MPP)
+    677                         {
+    678                            /* log the read-for-merge operation to ut_list */
+    679                            ut_list[ut_push].type   = UT_MERGE;
+    680                            ut_list[ut_push].offset = Offset&(~(SECTOR_PER_MPP-1));
+    681                            ut_list[ut_push].length = SECTOR_PER_MPP;
+    682                            ut_list[ut_push].buffer = BulkBuf;
+    683          
+    684                            /* handle ONFM read/write in user tasks */
+    685                            ut_push = (ut_push+1)%UT_LIST_SIZE;
+    686                            /* the ut_list should not be full */
+    687                            ASSERT(ut_push != ut_pop);
+    688          
+    689                            merge_stage = MERGE_START;
+    690                            merge_count = n;
+    691          
+    692                            /* not prime before get merged data */
+    693                            buffer = NULL;
+    694                            bulkout_len = 0;
+    695                         }
+    696                         else
+    697                         {
+    698                            /* CASE 1: data buffer aligned to MPP */
+    699                            buffer = BulkBuf;
+    700                            bulkout_len = MPP_SIZE;
+    701                         }
+    702                      }
+    703                      else
+    704                      {
+    705                         /* CASE 2: no buffer avaliable */
+    706                         buffer = NULL;
+    707                         bulkout_len = 0;
+    708                      }
+    709                   }
+    710                }
+    711                else if (BulkStage == MSC_BS_CBW)
+    712                {
+    713                   /* CASE 3: write data to CBW directly */
+    714                   buffer = &CBW;
+    715                   bulkout_len = sizeof(CBW);
+    716                }
+    717             }
+    718          
+    719             if (buffer != NULL)
+    720             {
+    721                USB_ReadReqEP(MSC_EP_OUT, buffer, bulkout_len);
+    722             }
+    723             else
+    724             {
+    725                /* if no buffer avaliable in device, skip priming OUT endpoint, and
+    726                 * then, a NAK will be sent to host in next transmittion. At that time,
+    727                 * we will try to allocate buffer again here. The buffer may be released
+    728                 * due to program completed.
+    729                 */
+    730                ;
+    731             }
+    732          }
+    733          
+    734          
+    735          void MSC_BulkOut(void)
+    736          {
+    737             BulkLen = USB_ReadEP(MSC_EP_OUT, BulkBuf);
+    738             switch (BulkStage)
+    739             {
+    740                case MSC_BS_CBW:
+    741                   MSC_GetCBW();
+    742                   break;
+    743                case MSC_BS_DATA_OUT:
+    744                   switch (CBW.CB[0])
+    745                   {
+    746                      case SCSI_WRITE10:
+    747                      case SCSI_WRITE12:
+    748                         MSC_MemoryWrite();
+    749                         break;
+    750                      case SCSI_VERIFY10:
+    751                         MSC_MemoryVerify();
+    752                         break;
+    753                   }
+    754                   break;
+    755                case MSC_BS_CSW:
+    756                   break;
+    757                default:
+    758                   MSC_SetStallEP(MSC_EP_OUT);
+    759                   CSW.bStatus = CSW_PHASE_ERROR;
+    760                   MSC_SetCSW();
+    761                   break;
+    762             }
+    763          }
+    764          
+    765          
+    766          static
+    767          UNS_32 DataIn_Format(void)
+    768          {
+    769             if (CBW.dDataLength == 0)
+    770             {
+    771                CSW.bStatus = CSW_PHASE_ERROR;
+    772                MSC_SetCSW();
+    773                return (FALSE);
+    774             }
+    775          
+    776             if ((CBW.bmFlags & 0x80) == 0)
+    777             {
+    778                MSC_SetStallEP(MSC_EP_OUT);
+    779                CSW.bStatus = CSW_PHASE_ERROR;
+    780                MSC_SetCSW();
+    781                return (FALSE);
+    782             }
+    783          
+    784             return (TRUE);
+    785          }
+    786          
+    787          
+    788          static
+    789          void DataIn_Transfer(void)
+    790          {
+    791             BulkLen = MIN(BulkLen, CBW.dDataLength);
+    792             BulkStage = MSC_BS_DATA_IN_LAST;
+    793          
+    794             USB_WriteEP(MSC_EP_IN, CMD_BulkBuf, BulkLen);
+    795          
+    796             CSW.dDataResidue = 0;
+    797             CSW.bStatus = CSW_CMD_PASSED;
+    798          }
+    799          
+    800          
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+       8   DataIn_Format
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+       8   DataIn_Transfer
+         8   -> USB_WriteEP
+       8   MSC_BulkIn
+         8   -> MSC_MemoryRead
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+       8   MSC_BulkInNak
+         8   -> USB_WriteEP
+       8   MSC_BulkOut
+         8   -> MSC_GetCBW
+         8   -> MSC_MemoryVerify
+         8   -> MSC_MemoryWrite
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+         8   -> USB_ReadEP
+       8   MSC_BulkOutNak
+         8   -> BUF_Allocate
+         8   -> USB_ReadReqEP
+         8 __aeabi_uidivmod
+       8   MSC_GetCBW
+         8   -> MSC_Inquiry
+         8   -> MSC_MemoryRead
+         8   -> MSC_ModeSense10
+         8   -> MSC_ModeSense6
+         8   -> MSC_RWSetup
+         8   -> MSC_ReadCapacity
+         8   -> MSC_ReadFormatCapacity
+         8   -> MSC_RequestSense
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+         8   -> MSC_TestUnitReady
+       0   MSC_GetMaxLUN
+       8   MSC_Init
+         8   -> ONFM_Capacity
+       8   MSC_Inquiry
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+      12   MSC_MemoryRead
+        12 __aeabi_uidivmod
+       8   MSC_MemoryVerify
+         8   -> MSC_SetCSW
+       8   MSC_MemoryWrite
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+         8 __aeabi_uidivmod
+       8   MSC_ModeSense10
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+       8   MSC_ModeSense6
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+       8   MSC_RWSetup
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+       8   MSC_ReadCapacity
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+       8   MSC_ReadFormatCapacity
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+       8   MSC_RequestSense
+         8   -> DataIn_Format
+         8   -> DataIn_Transfer
+       0   MSC_Reset
+       8   MSC_SetCSW
+         8   -> USB_WriteEP
+       8   MSC_SetStallEP
+         8   -> USB_SetStallEP
+       8   MSC_TestUnitReady
+         8   -> MSC_SetCSW
+         8   -> MSC_SetStallEP
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable12
+       4  ??DataTable12_1
+       4  ??DataTable14
+       4  ??DataTable14_1
+       4  ??DataTable14_2
+       4  ??DataTable14_3
+       4  ??DataTable14_4
+       4  ??DataTable14_5
+       4  ??DataTable15
+       4  ??DataTable16
+       4  ??DataTable18
+       4  ??DataTable18_1
+       4  ??DataTable18_2
+       4  ??DataTable18_3
+       4  ??DataTable19
+       4  ??DataTable19_1
+       4  ??DataTable20
+       4  ??DataTable20_1
+       4  ??DataTable21
+       4  ??DataTable21_1
+       4  ??DataTable21_2
+       4  ??DataTable21_3
+       4  ??DataTable22
+       4  ??DataTable22_1
+       4  ??DataTable22_10
+       4  ??DataTable22_11
+       4  ??DataTable22_12
+       4  ??DataTable22_2
+       4  ??DataTable22_3
+       4  ??DataTable22_4
+       4  ??DataTable22_5
+       4  ??DataTable22_6
+       4  ??DataTable22_7
+       4  ??DataTable22_8
+       4  ??DataTable22_9
+       4  ??DataTable5
+       4  ??DataTable5_1
+       4  ??DataTable6
+       4  ??DataTable6_1
+       4  ??DataTable6_2
+       4  ??DataTable6_3
+       4  ??DataTable6_4
+       4  ??DataTable6_5
+       4  ??DataTable6_6
+       4  ??DataTable6_7
+       4  ??DataTable6_8
+       4  ??DataTable7
+       4  ??DataTable7_1
+       4  ??DataTable7_2
+       4  ??DataTable8
+       4  ??DataTable8_1
+       4  ??DataTable8_2
+       4  ??DataTable9
+       4  BulkBuf
+       4  BulkLen
+       1  BulkStage
+      32  CBW
+     512  CMD_BulkBuf
+      16  CSW
+      56  DataIn_Format
+      64  DataIn_Transfer
+       4  Length
+       4  MSC_BlockCount
+      68  MSC_BulkIn
+      52  MSC_BulkInNak
+      88  MSC_BulkOut
+     316  MSC_BulkOutNak
+     406  MSC_GetCBW
+      10  MSC_GetMaxLUN
+      48  MSC_Init
+     238  MSC_Inquiry
+     230  MSC_MemoryRead
+      40  MSC_MemoryVerify
+     230  MSC_MemoryWrite
+      70  MSC_ModeSense10
+      46  MSC_ModeSense6
+     182  MSC_RWSetup
+      92  MSC_ReadCapacity
+     108  MSC_ReadFormatCapacity
+     130  MSC_RequestSense
+      22  MSC_Reset
+      26  MSC_SetCSW
+      42  MSC_SetStallEP
+      44  MSC_TestUnitReady
+       4  MemOK
+       4  Offset
+    2048  Read_BulkBuf
+       4  Read_BulkLen
+       4  merge_count
+       1  merge_stage
+     128  ut_list
+       4  ut_pop
+       4  ut_push
+
+ 
+ 2 778 bytes in section .bss
+ 2 820 bytes in section .text
+ 
+ 2 820 bytes of CODE memory
+ 2 778 bytes of DATA memory
+
+Errors: none
+Warnings: 3

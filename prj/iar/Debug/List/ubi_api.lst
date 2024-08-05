@@ -1,0 +1,697 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_api.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_api.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\ubi_api.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\ubi_api.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_api.c
+      1          /*********************************************************
+      2           * Module name: ubi_api.c
+      3           *
+      4           * Copyright 2010, 2011. All Rights Reserved, Crane Chu.
+      5           *
+      6           * This file is part of OpenNFM.
+      7           *
+      8           * OpenNFM is free software: you can redistribute it and/or 
+      9           * modify it under the terms of the GNU General Public 
+     10           * License as published by the Free Software Foundation, 
+     11           * either version 3 of the License, or (at your option) any 
+     12           * later version.
+     13           * 
+     14           * OpenNFM is distributed in the hope that it will be useful,
+     15           * but WITHOUT ANY WARRANTY; without even the implied 
+     16           * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     17           * PURPOSE. See the GNU General Public License for more 
+     18           * details.
+     19           *
+     20           * You should have received a copy of the GNU General Public 
+     21           * License along with OpenNFM. If not, see 
+     22           * <http://www.gnu.org/licenses/>.
+     23           *
+     24           * First written on 2010-01-01 by cranechu@gmail.com
+     25           *
+     26           * Module Description:
+     27           *    Unsorted Block Image.
+     28           *
+     29           *********************************************************/
+     30          
+     31          #include <core\inc\cmn.h>
+     32          #include <core\inc\mtd.h>
+     33          #include <core\inc\ubi.h>
+     34          #include <core\inc\buf.h>
+     35          #include <sys\sys.h>
+     36          #include "ubi_inc.h"
+     37          
+     38          /* NOTICE:
+     39           * PHY_BLOCK place die (channel/chip/die) index in low bits,
+     40           * one PHY_BLOCK combines blocks in multiple planes.
+     41           */
+     42          
+     43          typedef struct {
+     44            LOG_BLOCK log_block;
+     45            PHY_BLOCK phy_block; /* INVALID_BLOCK for empty slot */
+     46            ERASE_COUNT ec;
+     47            PAGE_OFF page;
+     48            void* buffer;
+     49            SPARE spare;
+     50          } DIE_HOLD_PAGE;
+     51          
+     52          static DIE_HOLD_PAGE dice_hold[TOTAL_DIE_COUNT];
+     53          static UINT8 tmp_data_buffer[MPP_SIZE];
+     54          
+     55          static STATUS ubi_reclaim_badblock(LOG_BLOCK log_block, PHY_BLOCK phy_block,
+     56                                             ERASE_COUNT phy_block_ec, PAGE_OFF bad_page,
+     57                                             PHY_BLOCK* new_phy_block,
+     58                                             ERASE_COUNT* new_ec);
+     59          
+     60          static UINT32 ubi_find_die_buffer(PHY_BLOCK block);
+     61          
+     62          STATUS UBI_Format() {
+     63            AREA area = 0;
+     64            PHY_BLOCK block_count;
+     65            PHY_BLOCK remaining_count;
+     66            PHY_BLOCK total_data_block = 0;
+     67            PHY_BLOCK fmt_current_block = DATA_FIRST_BLOCK;//7
+     68            STATUS ret = STATUS_SUCCESS;  
+     69            //jsj增加  
+     70            ANCHOR_Format_Clean();//先擦除6个anchor 块
+     71            /* try to read out only the anchor table first for bad block table */
+     72            ret = ANCHOR_Init();
+     73            //擦除6个anchor 块后将导致每次上电都读anchor table失败
+     74            //然后会重新扫描所有物理块，建立坏块表
+     75            if (ret != STATUS_SUCCESS) {
+     76              int bad_blk=0;
+     77              PHY_BLOCK block;
+     78              uart_printf("******UBI_Format():Blocks Layout****\r\n");
+     79              /* detect bad block and build up the bad block table */
+     80              for (block = 0; block < CFG_LOG_BLOCK_COUNT; block++) {
+     81                 //jsj 修改
+     82                /*
+     83                ret = MTD_CheckBlock(block);
+     84                if (ret == STATUS_SUCCESS) {
+     85                  ret = MTD_Erase(block);
+     86                }
+     87                if (ret != STATUS_SUCCESS) {
+     88                  uart_printf("%s: find a bad block: %d\r\n", __func__,block);
+     89                  ANCHOR_LogBadBlock(block);
+     90                }
+     91                */
+     92                ret = MTD_Erase(block);
+     93                if (ret != STATUS_BADBLOCK) 
+     94                {
+     95                  ret = MTD_CheckBlock(block);        
+     96                }
+     97                if (ret == STATUS_BADBLOCK)
+     98                {
+     99                  erase_counts[block] = 0xFFFFFFFF;
+    100                  bad_blk++;
+    101                  uart_printf("%s: find a bad block: %d.Bad block - %u\n", __func__, bad_blk, block);
+    102                  ANCHOR_LogBadBlock(block);
+    103                }      
+    104              }
+    105            }  
+    106              
+    107            do {
+    108              ASSERT(fmt_current_block < DATA_BLOCK_COUNT);    
+    109              //jsj修改
+    110              //remaining_count = DATA_BLOCK_COUNT - fmt_current_block;
+    111              remaining_count = (DATA_BLOCK_COUNT+DATA_FIRST_BLOCK) - fmt_current_block;
+    112              block_count = MIN(remaining_count, CFG_PHY_BLOCK_PER_AREA); 
+    113              
+    114              //uart_printf("%s: area=%d,fmt_current_block=%d,block_count=%d\r\n",__func__,area,fmt_current_block,block_count);
+    115              
+    116              /* formatting area */
+    117              fmt_current_block = AREA_Format(block_count, fmt_current_block, area);
+    118              if (fmt_current_block != INVALID_BLOCK) {
+    119                area++;
+    120                /* TODO: consider bad block. Count read total_data_block in AREA_Format. */
+    121                total_data_block += block_count;
+    122              } else {
+    123                break;
+    124              }
+    125            } while (fmt_current_block < DATA_BLOCK_COUNT);
+    126            
+    127            uart_printf("total_data_block=%d\r\n",total_data_block);
+    128              
+    129          
+    130            if (fmt_current_block != INVALID_BLOCK) {
+    131              //jsj增加  保证Index block是好块  
+    132              while (ANCHOR_IsBadBlock(fmt_current_block) == TRUE) {
+    133                fmt_current_block++;
+    134              }
+    135              /* formatting index */
+    136              //uart_printf("%s Index PEB = %d\n", __func__, fmt_current_block);
+    137              fmt_current_block = INDEX_Format(CFG_LOG_BLOCK_COUNT, fmt_current_block);
+    138            }
+    139          
+    140            if (fmt_current_block != INVALID_BLOCK) {
+    141              ASSERT(fmt_current_block == CFG_LOG_BLOCK_COUNT);
+    142              /* formatting anchor */
+    143              ret = ANCHOR_Format(total_data_block);
+    144            } else {
+    145              /* write anchor table to log bad block table */
+    146              (void) ANCHOR_Format(INVALID_BLOCK);
+    147              ret = STATUS_UBI_FORMAT_ERROR;
+    148            }  
+    149            return ret;
+    150          }
+    151          
+    152          STATUS UBI_Init() {
+    153            AREA area;
+    154            AREA updating_area;
+    155            UINT32 die;
+    156            PHY_BLOCK updating_logical_block = INVALID_BLOCK;
+    157            PHY_BLOCK updating_origin_block = INVALID_BLOCK;
+    158            ERASE_COUNT updating_block_ec = INVALID_EC;
+    159            STATUS ret;
+    160          
+    161            ret = ANCHOR_Init();
+    162            if (ret == STATUS_SUCCESS) {
+    163              /* init/plr index table, and get the plr info of area update */
+    164              ret = INDEX_Init(&updating_logical_block, &updating_origin_block,
+    165                               &updating_block_ec);
+    166            }
+    167            //uart_printf("**%s**: %d,%d,%d\r\n", __func__,updating_logical_block,updating_origin_block,updating_block_ec);
+    168          
+    169            if (ret == STATUS_SUCCESS) {
+    170              /* find the updating area */
+    171              if (updating_logical_block != INVALID_BLOCK) {
+    172                updating_area = AREA_INDEX(updating_logical_block);
+    173              } else {
+    174                updating_area = INVALID_AREA;
+    175              }
+    176              for (area = 0; area < AREA_COUNT; area++) {
+    177                /* read out the area table, and setup the area offset table */
+    178                ret = AREA_Init(area);
+    179                if (ret == STATUS_SUCCESS) {
+    180                  if (area == updating_area) {
+    181                    /* check the data of the area for PLR */          
+    182                    uart_printf("**%s**:updating_area=%d\r\n", __func__,updating_area);          
+    183                    if (AREA_CheckUpdatePLR(updating_logical_block, updating_origin_block,updating_block_ec) == TRUE) {
+    184                      /* continue to update the area table */
+    185                      INDEX_Update_AreaUpdate(updating_logical_block, updating_origin_block, updating_block_ec);
+    186                      ret = INDEX_Update_Commit();
+    187                    }
+    188                  }
+    189                } else {
+    190                  break;
+    191                }
+    192              }
+    193            }
+    194            if (ret == STATUS_SUCCESS) {
+    195              for (die = 0; die < TOTAL_DIE_COUNT; die++) {
+    196                dice_hold[die].phy_block = INVALID_BLOCK;
+    197              }
+    198            }
+    199            return ret;
+    200          }
+    201          
+    202          STATUS UBI_Read(LOG_BLOCK block, PAGE_OFF page, void* buffer, SPARE spare) {
+    203            PHY_BLOCK phy_block;
+    204            STATUS ret = STATUS_SUCCESS;
+    205          
+    206            if (block != INVALID_BLOCK && page != INVALID_PAGE) {
+    207                
+    208              phy_block = AREA_GetBlock(block); 
+    209              
+    210              ASSERT(phy_block != INVALID_BLOCK);
+    211              /* TODO: handle the read fail issue, or ECC danger issue */
+    212              ret = MTD_Read(phy_block, page, buffer, spare);
+    213            } else {
+    214              ASSERT(block == INVALID_BLOCK && page == INVALID_PAGE);
+    215              /* read from invalid page, fill the empty buffer all ZERO */
+    216              memset(buffer, 0, MPP_SIZE);
+    217            }
+    218            return ret;
+    219          }
+    220          
+    221          STATUS UBI_Write(LOG_BLOCK block, PAGE_OFF page, void* buffer, SPARE spare,BOOL async) {
+    222            ERASE_COUNT phy_block_ec;
+    223            ERASE_COUNT new_ec;
+    224            PHY_BLOCK phy_block;
+    225            PHY_BLOCK new_phy_block = INVALID_BLOCK;
+    226            STATUS ret;
+    227            UINT32 die_index = 0;
+    228          
+    229            phy_block = AREA_GetBlock(block); 
+    230            phy_block_ec = AREA_GetEC(block);
+    231            ASSERT(phy_block != INVALID_BLOCK);
+    232          
+    233            /* check the last page status on the same die */
+    234            ret = MTD_WaitReady(phy_block);
+    235            while (ret == STATUS_BADBLOCK) {
+    236              /* find the buffer in the same die */
+    237              die_index = ubi_find_die_buffer(phy_block);
+    238          
+    239              ASSERT(dice_hold[die_index].phy_block != INVALID_BLOCK);
+    240          
+    241              /* reclaim earlier pages */
+    242              ret = ubi_reclaim_badblock(dice_hold[die_index].log_block,
+    243                                         dice_hold[die_index].phy_block,
+    244                                         dice_hold[die_index].ec,
+    245                                         dice_hold[die_index].page, &new_phy_block,
+    246                                         &new_ec);
+    247              if (ret == STATUS_SUCCESS && dice_hold[die_index].phy_block != INVALID_BLOCK) {
+    248                dice_hold[die_index].phy_block = new_phy_block;
+    249                dice_hold[die_index].ec = new_ec;
+    250                /* write last page in die buffer */
+    251                //jsj 下面写的应是坏块中坏页的内容
+    252                ret = MTD_Program(new_phy_block, dice_hold[die_index].page,
+    253                                  dice_hold[die_index].buffer,
+    254                                  dice_hold[die_index].spare);
+    255              }
+    256              if (ret == STATUS_SUCCESS) {
+    257                ret = MTD_WaitReady(new_phy_block);
+    258                
+    259              }
+    260            }
+    261          
+    262            if (ret == STATUS_SUCCESS && dice_hold[die_index].phy_block != INVALID_BLOCK) {
+    263              ASSERT(dice_hold[die_index].buffer != NULL);
+    264          
+    265              /* release the die buffer */
+    266              BUF_Free(dice_hold[die_index].buffer);
+    267              dice_hold[die_index].buffer = NULL;
+    268              dice_hold[die_index].phy_block = INVALID_BLOCK;
+    269            }
+    270              
+    271            if (ret == STATUS_SUCCESS && page != INVALID_PAGE) {
+    272              ASSERT(buffer != NULL);
+    273              /* write current page */
+    274              ret = MTD_Program(phy_block, page, buffer, spare);
+    275            }
+    276          
+    277            if (ret == STATUS_SUCCESS && page != INVALID_PAGE) {
+    278              ASSERT(buffer != NULL);
+    279              if (async == FALSE) {
+    280                ret = MTD_WaitReady(phy_block);
+    281                while (ret == STATUS_BADBLOCK) {
+    282                  ret = ubi_reclaim_badblock(block, phy_block, phy_block_ec, page,
+    283                                             &new_phy_block, &new_ec);
+    284                  if (ret == STATUS_SUCCESS) {
+    285                    /* write last page in die buffer */
+    286                    ret = MTD_Program(new_phy_block, page, buffer, spare);
+    287                  }
+    288          
+    289                  if (ret == STATUS_SUCCESS) {
+    290                    ret = MTD_WaitReady(new_phy_block);
+    291                    // Bo: I suspect the following while loop has some bugs when the SSD needs to reclaim bad blocks mutiple times. 
+    292                    // a correct way should update the old phy_block with the new_phy_block during each loop
+    293                    // the following lines added by Bo to fix the bug
+    294                    phy_block = new_phy_block;
+    295                    phy_block_ec = new_ec;
+    296                  }
+    297                }
+    298                ASSERT(ret == STATUS_SUCCESS);
+    299                BUF_Free(buffer);
+    300              } else {
+    301                /* save in dice_hold */
+    302                dice_hold[die_index].log_block = block;
+    303                dice_hold[die_index].phy_block = phy_block;
+    304                dice_hold[die_index].ec = phy_block_ec;
+    305                dice_hold[die_index].page = page;
+    306                dice_hold[die_index].buffer = buffer;
+    307                dice_hold[die_index].spare[0] = spare[0];
+    308                dice_hold[die_index].spare[1] = spare[1];
+    309              }
+    310            }
+    311            return ret;
+    312          }
+    313          
+    314          STATUS UBI_Flush() {
+    315            UINT32 i;
+    316            STATUS ret = STATUS_SUCCESS;
+    317          
+    318            for (i = 0; i < TOTAL_DIE_COUNT; i++) {
+    319              if (ret == STATUS_SUCCESS) {
+    320                /* check the status of a write buffer in one die */
+    321                ret = UBI_Write(dice_hold[i].log_block, INVALID_PAGE, NULL, NULL, TRUE);
+    322              }
+    323            }
+    324          
+    325            return ret;
+    326          }
+    327          
+    328          STATUS UBI_Erase(LOG_BLOCK block, LOG_BLOCK die_index) {
+    329            STATUS ret = STATUS_SUCCESS;
+    330            UINT32 die = die_index % TOTAL_DIE_COUNT;//只有一个die，die=0
+    331            PHY_BLOCK phy_block = INVALID_BLOCK;
+    332            ERASE_COUNT ec = INVALID_EC;
+    333            static UINT32 last_position = 0;
+    334            /* flush the program on the same die with the block to erase */
+    335            ret = UBI_Write(dice_hold[die].log_block, INVALID_PAGE, NULL, NULL, TRUE);
+    336            if (ret == STATUS_SUCCESS) {
+    337              ret = INDEX_FreeBlock_Get(die_index % TOTAL_DIE_COUNT, &phy_block, &ec);
+    338            }
+    339          
+    340            if (ret == STATUS_SUCCESS) {
+    341              ASSERT(block != INVALID_BLOCK && ec != INVALID_EC);
+    342              INDEX_FreeBlock_Put(AREA_GetBlock(block), AREA_GetEC(block));
+    343              INDEX_Update_AreaUpdate(block, phy_block, ec);
+    344              ret = INDEX_Update_Commit();
+    345            }
+    346          
+    347            if (last_position < 300)
+    348              last_position++;
+    349            else {
+    350              //reset the counter
+    351              last_position = 0;
+    352              if (ret == STATUS_SUCCESS) {
+    353                ret = UBI_Flush();
+    354              }
+    355          
+    356              if (ret == STATUS_SUCCESS) {
+    357                ret = UBI_SWL();
+    358              }
+    359            }
+    360            return ret;
+    361          }
+    362          
+    363          STATUS UBI_SWL() {
+    364            BLOCK_OFF min_block_offset;
+    365            PHY_BLOCK min_physical_block;
+    366            ERASE_COUNT min_block_ec;
+    367            PHY_BLOCK max_physical_block;
+    368            ERASE_COUNT max_block_ec;
+    369            PHY_BLOCK logical_block;
+    370            PAGE_OFF i;
+    371            STATUS ret = STATUS_SUCCESS;
+    372            SPARE spare;
+    373          
+    374            /* static wear leveling (SWL):
+    375             * pooling one area, and get the block with min EC in the area,
+    376             * exchange it with the max EC block in FBT, if their EC
+    377             * difference is larger than a threshold.*/
+    378            //用（N:空闲块表擦除次数最大的块）替换掉（M:area正使用块中擦除次数最小的块）
+    379            //因为M中的数据一般就是cold数据，可以转存到擦除较大的块中。  
+    380            min_block_offset = AREA_FindMinECBlock(anchor_table.swl_current_area,
+    381                                                   &min_physical_block, &min_block_ec);
+    382            INDEX_FreeBlock_GetMaxECBlock(&max_physical_block, &max_block_ec);
+    383          
+    384            /* check if SWL is required */
+    385            if (max_physical_block != min_physical_block&& max_physical_block != INVALID_BLOCK
+    386                && min_physical_block != INVALID_BLOCK && max_block_ec != INVALID_EC
+    387                && min_block_ec != INVALID_EC && max_block_ec > min_block_ec
+    388                && max_block_ec - min_block_ec > STATIC_WL_THRESHOLD) {
+    389          
+    390              /* erase the new max-ec-block first */
+    391              ret = MTD_Erase(max_physical_block);
+    392          
+    393              /* copy data from min ec block to max ec block. */
+    394              for (i = 0; i < PAGE_PER_PHY_BLOCK; i++) {
+    395                if (ret == STATUS_SUCCESS) {
+    396                  /* may read erased page, so acceptable error happen */
+    397                  (void) MTD_Read(min_physical_block, i, tmp_data_buffer, spare);
+    398                  ret = MTD_Program(max_physical_block, i, tmp_data_buffer, spare);
+    399                }
+    400          
+    401                if (ret == STATUS_SUCCESS) {
+    402                  ret = MTD_WaitReady(max_physical_block);
+    403                }
+    404          
+    405                if (ret != STATUS_SUCCESS) {
+    406                  /* SWL fail, area table and free table are no changed,
+    407                   * so, nothing to do to recover.
+    408                   */
+    409                  break;
+    410                }
+    411              }
+    412          
+    413              if (ret == STATUS_SUCCESS) {
+    414                ASSERT(i == PAGE_PER_PHY_BLOCK);
+    415                /* UPDATE area table. no need to touch cache block even exists */
+    416                logical_block = ((anchor_table.swl_current_area) * CFG_PHY_BLOCK_PER_AREA) + min_block_offset;
+    417                INDEX_Update_AreaUpdate(logical_block, max_physical_block, max_block_ec);
+    418          
+    419                /* update the free block table */
+    420                INDEX_FreeBlock_SwapMaxECBlock(min_physical_block, min_block_ec);
+    421          
+    422                /* update index table (free block, and area index table if need) and
+    423                 * area table at once.
+    424                 */
+    425                ret = INDEX_Update_Commit();
+    426              }
+    427            } else {
+    428              /* do SWL in next area in the next cycle */
+    429              anchor_table.swl_current_area = (anchor_table.swl_current_area + 1) % AREA_COUNT;
+    430            }
+    431            return ret;
+    432          }
+    433          
+    434          STATUS UBI_ReadStatus(LOG_BLOCK block) {
+    435            /* when choose journal blocks, erase free blocks, and choose other
+    436             * blocks in different dice through calling this function to get
+    437             * the status of nand dice.
+    438             *
+    439             * when writing journal blocks, write data to on block, and write other
+    440             * data to different blocks in different dice through calling this function
+    441             * to get the status of block programming, then achieve intereleave
+    442             * programming across all dice.
+    443             */
+    444            PHY_BLOCK phy_block;
+    445            STATUS ret = STATUS_SUCCESS;
+    446          
+    447            phy_block = AREA_GetBlock(block);
+    448            ASSERT(phy_block != INVALID_BLOCK);
+    449          
+    450            ret = MTD_ReadStatus(phy_block);
+    451          
+    452            return ret;
+    453          }
+    454          
+    455          static STATUS ubi_reclaim_badblock(LOG_BLOCK log_block, PHY_BLOCK phy_block,
+    456                                             ERASE_COUNT phy_block_ec, PAGE_OFF bad_page,
+    457                                             PHY_BLOCK* new_phy_block,
+    458                                             ERASE_COUNT* new_phy_ec) {
+    459            PHY_BLOCK new_block;
+    460            ERASE_COUNT new_ec;
+    461            PAGE_OFF i;
+    462            STATUS ret = STATUS_SUCCESS;
+    463            SPARE spare;
+    464          
+    465            /* Reclaim Bad Block:
+    466             * - get another free block, if none, return fail
+    467             * - reclaim bad block, copying 0~page-1
+    468             * - add bad block to free block table, with ec+100.*/
+    469          
+    470            if (ret == STATUS_SUCCESS) {
+    471              ret = INDEX_FreeBlock_Get(phy_block, &new_block, &new_ec);
+    472            }
+    473          
+    474            if (ret == STATUS_SUCCESS) {
+    475              /* copy pages */
+    476              for (i = 0; i < bad_page; i++) {
+    477                if (ret == STATUS_SUCCESS) {
+    478                  (void) MTD_Read(phy_block, i, tmp_data_buffer, spare);
+    479                  ret = MTD_Program(new_block, i, tmp_data_buffer, spare);
+    480                }
+    481          
+    482                if (ret == STATUS_SUCCESS) {
+    483                  ret = MTD_WaitReady(new_block);
+    484                }
+    485          
+    486                if (ret != STATUS_SUCCESS) {
+    487                  break;
+    488                }
+    489              }
+    490            }
+    491          
+    492            if (ret == STATUS_SUCCESS) {
+    493              /* put back bad block to free blocks with a higher ec to prevent
+    494               * using soon. The block will be discarded only when erase failed.
+    495               */
+    496              INDEX_FreeBlock_Put(phy_block, phy_block_ec + STATIC_WL_THRESHOLD);
+    497              INDEX_Update_AreaUpdate(log_block, new_block, new_ec);
+    498              ret = INDEX_Update_Commit();
+    499            }
+    500          
+    501            if (ret == STATUS_SUCCESS) {
+    502              *new_phy_block = new_block;
+    503              *new_phy_ec = new_ec;
+    504            } else {
+    505              *new_phy_block = INVALID_BLOCK;
+    506              *new_phy_ec = INVALID_EC;
+    507            }
+    508          
+    509            return ret;
+    510          }
+    511          
+    512          static UINT32 ubi_find_die_buffer(PHY_BLOCK block) {
+    513            UINT32 i;
+    514            UINT32 die_index = block >> BLOCK_PER_PLANE_SHIFT;
+    515          
+    516            for (i = 0; i < TOTAL_DIE_COUNT; i++) {
+    517              if ((dice_hold[i].phy_block) != INVALID_BLOCK
+    518                  && ((dice_hold[i].phy_block) >> BLOCK_PER_PLANE_SHIFT) == die_index) {
+    519                break;
+    520              }
+    521            }
+    522            ASSERT(i != TOTAL_DIE_COUNT);
+    523            return i;
+    524          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+      32   UBI_Erase
+        32   -> AREA_GetBlock
+        32   -> AREA_GetEC
+        32   -> INDEX_FreeBlock_Get
+        32   -> INDEX_FreeBlock_Put
+        32   -> INDEX_Update_AreaUpdate
+        32   -> INDEX_Update_Commit
+        32   -> UBI_Flush
+        32   -> UBI_SWL
+        32   -> UBI_Write
+      16   UBI_Flush
+        16   -> UBI_Write
+      24   UBI_Format
+        24   -> ANCHOR_Format
+        24   -> ANCHOR_Format_Clean
+        24   -> ANCHOR_Init
+        24   -> ANCHOR_IsBadBlock
+        24   -> ANCHOR_LogBadBlock
+        24   -> AREA_Format
+        24   -> INDEX_Format
+        24   -> MTD_CheckBlock
+        24   -> MTD_Erase
+        24   -> uart_printf
+      32   UBI_Init
+        32   -> ANCHOR_Init
+        32   -> AREA_CheckUpdatePLR
+        32   -> AREA_Init
+        32   -> INDEX_Init
+        32   -> INDEX_Update_AreaUpdate
+        32   -> INDEX_Update_Commit
+        32   -> uart_printf
+      24   UBI_Read
+        24   -> AREA_GetBlock
+        24   -> MTD_Read
+        24   -> __aeabi_memset
+       8   UBI_ReadStatus
+         8   -> AREA_GetBlock
+         8   -> MTD_ReadStatus
+      48   UBI_SWL
+        48   -> AREA_FindMinECBlock
+        48   -> INDEX_FreeBlock_GetMaxECBlock
+        48   -> INDEX_FreeBlock_SwapMaxECBlock
+        48   -> INDEX_Update_AreaUpdate
+        48   -> INDEX_Update_Commit
+        48   -> MTD_Erase
+        48   -> MTD_Program
+        48   -> MTD_Read
+        48   -> MTD_WaitReady
+        48 __aeabi_uidivmod
+      56   UBI_Write
+        56   -> AREA_GetBlock
+        56   -> AREA_GetEC
+        56   -> BUF_Free
+        56   -> MTD_Program
+        56   -> MTD_WaitReady
+        56   -> ubi_find_die_buffer
+        56   -> ubi_reclaim_badblock
+      40   printint
+        40   -> UartWrite
+        40 __aeabi_uidiv
+        40 __aeabi_uidivmod
+      56   printuint
+        56   -> UartWrite
+        56 __aeabi_uidiv
+        56 __aeabi_uidivmod
+      40   uart_printf
+        40   -> UartWrite
+        40   -> printint
+        40   -> printuint
+       4   ubi_find_die_buffer
+      48   ubi_reclaim_badblock
+        48   -> INDEX_FreeBlock_Get
+        48   -> INDEX_FreeBlock_Put
+        48   -> INDEX_Update_AreaUpdate
+        48   -> INDEX_Update_Commit
+        48   -> MTD_Program
+        48   -> MTD_Read
+        48   -> MTD_WaitReady
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable10
+       4  ??DataTable10_1
+       4  ??DataTable10_2
+       4  ??DataTable10_3
+       4  ??DataTable3
+       4  ??DataTable4
+       4  ??DataTable4_1
+       4  ??DataTable4_2
+       4  ??DataTable4_3
+       4  ??DataTable4_4
+       4  ??DataTable4_5
+       4  ??DataTable4_6
+       4  ??DataTable4_7
+       4  ??DataTable4_8
+       4  ??DataTable5
+       4  ??DataTable5_1
+       4  ??DataTable6
+       8  ?_0
+      40  ?_1
+      44  ?_2
+      24  ?_3
+      28  ?_4
+     200  UBI_Erase
+      52  UBI_Flush
+     246  UBI_Format
+     188  UBI_Init
+     102  UBI_Read
+      30  UBI_ReadStatus
+     244  UBI_SWL
+     574  UBI_Write
+      36  dice_hold
+      20  digits
+      20  digits
+       4  last_position
+     104  printint
+      64  printuint
+    2048  tmp_data_buffer
+     210  uart_printf
+      54  ubi_find_die_buffer
+     176  ubi_reclaim_badblock
+      24  -- Other
+
+ 
+ 2 088 bytes in section .bss
+    40 bytes in section .data
+   168 bytes in section .rodata
+ 2 312 bytes in section .text
+ 
+ 2 312 bytes of CODE  memory
+   168 bytes of CONST memory
+ 2 128 bytes of DATA  memory
+
+Errors: none
+Warnings: none

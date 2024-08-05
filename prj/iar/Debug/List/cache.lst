@@ -1,0 +1,134 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:20
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\cache.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\cache.c -D BOOT_LEVEL_2 -lcN
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\cache.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\cache.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\cache.c
+      1          #include "cache.h"
+      2          #include <sys\sys.h>
+      3          #include <stdlib.h>
+      4          
+      5          UINT32 __CACHE_Header = 0;
+      6          
+      7          void CACHE_Add(CACHE* cache, PGADDR page)
+      8          {
+      9            if(cache->head != cache->size) {
+     10              cache->contents[cache->head] = page;
+     11              cache->head++;
+     12            }
+     13          }
+     14          
+     15          CACHE* CACHE_Create(UINT32 size, UINT32 range)
+     16          {
+     17            CACHE* cache = malloc(sizeof(CACHE));
+     18            cache->contents = malloc(sizeof(PGADDR)*size);
+     19            cache->range = range;
+     20            cache->size = size;
+     21            cache->head = 0;
+     22            return cache;
+     23          }
+     24          
+     25          void CACHE_Reset(CACHE* cache)
+     26          {
+     27            cache->head = 0;
+     28          }
+     29          
+     30          BOOL CACHE_Contains(CACHE* cache, PGADDR page)
+     31          {
+     32            UINT32 low = 0;
+     33            UINT32 high = cache->head - 1;
+     34            UINT32 mid;
+     35            PGADDR comp;
+     36            //Second condition handles underflow
+     37            while(low < high && high < cache->head)
+     38            {
+     39              mid = (low + high)/2;
+     40              comp = cache->contents[mid];
+     41              if(page >= comp && page < comp + cache->range)
+     42              {
+     43                return TRUE;
+     44              }
+     45              else if(page < comp)
+     46              {
+     47                high = mid - 1;
+     48              }
+     49              else
+     50              {
+     51                low = mid + 1;
+     52              }
+     53            }
+     54            
+     55            if(page >= cache->contents[low] && page < cache->contents[low] + cache->range)
+     56            {
+     57              return TRUE;
+     58            }
+     59            else
+     60            {
+     61              return FALSE;
+     62            }
+     63          }
+     64          
+     65          CACHE* CACHE_Clear(CACHE* cache)
+     66          {
+     67            free(cache->contents);
+     68            free(cache);
+     69            return 0;
+     70          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+       8   CACHE_Add
+       8   CACHE_Clear
+         8   -> free
+      16   CACHE_Contains
+      16   CACHE_Create
+        16   -> malloc
+       0   CACHE_Reset
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+      28  CACHE_Add
+      20  CACHE_Clear
+      98  CACHE_Contains
+      36  CACHE_Create
+       6  CACHE_Reset
+       4  __CACHE_Header
+
+ 
+   4 bytes in section .bss
+ 188 bytes in section .text
+ 
+ 188 bytes of CODE memory
+   4 bytes of DATA memory
+
+Errors: none
+Warnings: none

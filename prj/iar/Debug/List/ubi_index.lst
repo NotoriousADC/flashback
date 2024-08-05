@@ -1,0 +1,644 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_index.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_index.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\ubi_index.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\ubi_index.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\ubi\ubi_index.c
+      1          /*********************************************************
+      2           * Module name: ubi_index.c
+      3           *
+      4           * Copyright 2010, 2011. All Rights Reserved, Crane Chu.
+      5           *
+      6           * This file is part of OpenNFM.
+      7           *
+      8           * OpenNFM is free software: you can redistribute it and/or 
+      9           * modify it under the terms of the GNU General Public 
+     10           * License as published by the Free Software Foundation, 
+     11           * either version 3 of the License, or (at your option) any 
+     12           * later version.
+     13           * 
+     14           * OpenNFM is distributed in the hope that it will be useful,
+     15           * but WITHOUT ANY WARRANTY; without even the implied 
+     16           * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     17           * PURPOSE. See the GNU General Public License for more 
+     18           * details.
+     19           *
+     20           * You should have received a copy of the GNU General Public 
+     21           * License along with OpenNFM. If not, see 
+     22           * <http://www.gnu.org/licenses/>.
+     23           *
+     24           * First written on 2010-01-01 by cranechu@gmail.com
+     25           *
+     26           * Module Description:
+     27           *    Manage index table in ram and nand.
+     28           *
+     29           *********************************************************/
+     30          
+     31          #include <core\inc\cmn.h>
+     32          #include <core\inc\mtd.h>
+     33          #include <sys\sys.h>
+     34          #include "ubi_inc.h"
+     35          
+     36          /*
+     37           * ANCHOR table is not managed by FTL/TABLE module. It is self-PLR-safe.
+     38           *
+     39           * To achieve the Static Wear Leveling (SWL), the EC of every PHY_BLOCK
+     40           * is traced in Erase Count Table (ECT), which is located in the following
+     41           * sector of above tables. SWL works as a background task. A block in a area,
+     42           * which has the minimal EC, is selected, and switched with the first
+     43           * block in FBT, only when the difference of their ECs is larger than a
+     44           * predefined threhold. In this way, the static blocks can be found and used.
+     45           *
+     46           * An index table has 4 sectors. The 1st sector is ZIT, the 2nd is ECT
+     47           * of ZIT; the 3rd one has FBT, IBT, CBT, RBT, RFT, and the 4th one is the ECT.
+     48           */
+     49          
+     50          static STATUS index_update();
+     51          
+     52          INDEX_TABLE index_table;
+     53          
+     54          /* current index table block, and its erase count */
+     55          static PHY_BLOCK index_block;
+     56          static ERASE_COUNT index_block_ec;
+     57          static PAGE_OFF index_next_page;
+     58          static BOOL is_updating_area = FALSE;
+     59          
+     60          PHY_BLOCK INDEX_Format(PHY_BLOCK total_block, PHY_BLOCK fmt_current_block) {
+     61            UINT32 i;
+     62            UINT32 free_block_index = 0;
+     63            PHY_BLOCK index_block = INVALID_BLOCK;
+     64            STATUS ret = STATUS_SUCCESS;
+     65          
+     66            /* clear plr info */
+     67            index_table.area_update_plr.area_updating_logical_block = INVALID_BLOCK;
+     68            index_table.area_update_plr.area_updating_physical_block = INVALID_BLOCK;
+     69            index_table.area_update_plr.area_updating_block_ec = INVALID_EC;
+     70          
+     71            /* free block table: all remaining block */
+     72            for (i = 0; fmt_current_block < total_block; fmt_current_block++, i++) {
+     73              /* log good block, discard bad block */
+     74              if (ANCHOR_IsBadBlock(fmt_current_block) == FALSE) {
+     75                ret = MTD_Erase(fmt_current_block);
+     76                if (ret != STATUS_SUCCESS) {
+     77                  /* mark bad block */
+     78                  ANCHOR_LogBadBlock(fmt_current_block);
+     79                }
+     80              } 
+     81              else {
+     82                ret = STATUS_BADBLOCK;
+     83              }
+     84              if (ret == STATUS_SUCCESS) {
+     85                if (index_block == INVALID_BLOCK) {
+     86                  /* the first free block should be reserved for index block */
+     87                  index_block = fmt_current_block;
+     88                  uart_printf("**%s**: index physical block = %d\n", __func__, fmt_current_block);
+     89                } else {
+     90                  /* the reserved free block in block index table should be large
+     91                   * enough to hold the 2% reserved free block of total block count.
+     92                   */
+     93                  ASSERT(free_block_index < FREE_BLOCK_COUNT);
+     94                  index_table.free_block_table[free_block_index] = fmt_current_block;
+     95                  index_table.free_block_ect[free_block_index] = 0;
+     96                  free_block_index++;
+     97                }
+     98              }
+     99            }  
+    100            uart_printf("**%s**: free blocks total num= %d\n", __func__,free_block_index);
+    101          
+    102            /* fill all remaining free block table as invalid block */
+    103            for (i = free_block_index; i < FREE_BLOCK_COUNT; i++) {
+    104              index_table.free_block_table[i] = INVALID_BLOCK;
+    105              index_table.free_block_ect[i] = INVALID_EC;
+    106            }
+    107            ASSERT(sizeof(index_table) == MPP_SIZE);
+    108          
+    109            /* write index table, with EC sectors */
+    110            if (index_block == INVALID_BLOCK) {
+    111              ASSERT(ret != STATUS_SUCCESS);
+    112            }
+    113          
+    114            /* write area table, with EC sector, check and erase block first */
+    115            if (ret == STATUS_SUCCESS) {
+    116              if (ANCHOR_IsBadBlock(index_block) == TRUE) {
+    117                ret = STATUS_BADBLOCK;
+    118              }
+    119            }
+    120          
+    121            if (ret == STATUS_SUCCESS) {
+    122              ret = MTD_Erase(index_block);
+    123            }
+    124          
+    125            if (ret == STATUS_SUCCESS) {       
+    126              ret = TABLE_Write(index_block, 0, &index_table);    
+    127            }
+    128          
+    129            if (ret == STATUS_SUCCESS) {
+    130              /* setup index block info in cfg table */
+    131              anchor_table.index_new_block = index_block;
+    132              anchor_table.index_new_ec = 0;
+    133              anchor_table.index_old_block = INVALID_BLOCK;
+    134              anchor_table.index_old_ec = INVALID_EC;
+    135            } else {
+    136              /* mark bad block, pick another block for index. */
+    137              ANCHOR_LogBadBlock(index_block);
+    138              fmt_current_block = INVALID_BLOCK;
+    139            }
+    140            return fmt_current_block;
+    141          }
+    142          
+    143          STATUS INDEX_Init(PHY_BLOCK* logical_block, PHY_BLOCK* origin_block,
+    144                            ERASE_COUNT* block_ec) {
+    145            PAGE_OFF page_offset = INVALID_OFFSET;
+    146            STATUS ret = STATUS_FAILURE;
+    147          
+    148            is_updating_area = FALSE;
+    149          
+    150            /* PLR of index block reclaim: try to read new block first */
+    151            ASSERT(anchor_table.index_new_block != INVALID_BLOCK);
+    152            ret = TABLE_Read(anchor_table.index_new_block, &page_offset, &index_table);
+    153            if (ret == STATUS_SUCCESS) {
+    154              /* the new block has valid index table */
+    155              index_block = anchor_table.index_new_block;
+    156              index_block_ec = anchor_table.index_new_ec;
+    157              index_next_page = page_offset + 1;
+    158              /* this page may be written before PL, just write it to overwrite it */
+    159              (void) index_update();
+    160            } else {
+    161              /* can not get correct data from new block, read in old block for PLR */
+    162              ASSERT(anchor_table.index_old_block != INVALID_BLOCK);
+    163              ret = TABLE_Read(anchor_table.index_old_block, &page_offset, &index_table);
+    164              if (ret == STATUS_SUCCESS) {
+    165                /* finish the reclaim before PL */
+    166                index_block = anchor_table.index_old_block;
+    167                index_block_ec = anchor_table.index_old_ec;
+    168                index_next_page = PAGE_PER_PHY_BLOCK;
+    169                /* update index table to new block */
+    170                ret = index_update();
+    171              }
+    172            }
+    173          
+    174            /* set up the area plr info */
+    175            *logical_block = index_table.area_update_plr.area_updating_logical_block;
+    176            *origin_block = index_table.area_update_plr.area_updating_physical_block;
+    177            *block_ec = index_table.area_update_plr.area_updating_block_ec;
+    178          
+    179            return ret;
+    180          }
+    181          
+    182          void INDEX_Update_AreaReclaim(AREA area, PHY_BLOCK new_block, ERASE_COUNT nec) {
+    183            /* release old area block */
+    184            INDEX_FreeBlock_Put(index_table.area_index_table[area],
+    185                                index_table.area_index_ect[area]);
+    186          
+    187            /* setup new area block */
+    188            index_table.area_index_table[area] = new_block;
+    189            index_table.area_index_ect[area] = nec;
+    190          }
+    191          
+    192          void INDEX_Update_AreaUpdate(LOG_BLOCK logical_block, PHY_BLOCK physical_block,
+    193                                       ERASE_COUNT block_ec) {
+    194            ASSERT(physical_block != INVALID_BLOCK && block_ec != INVALID_EC);
+    195          
+    196            index_table.area_update_plr.area_updating_logical_block = logical_block;
+    197            index_table.area_update_plr.area_updating_physical_block = physical_block;
+    198            index_table.area_update_plr.area_updating_block_ec = block_ec;
+    199            is_updating_area = TRUE;
+    200          }
+    201          
+    202          /* update index table, and area table if necessary */
+    203          STATUS INDEX_Update_Commit() {
+    204            AREA area;
+    205            BOOL area_reclaim = FALSE;
+    206            STATUS ret = STATUS_SUCCESS;
+    207            PHY_BLOCK new_area_block = INVALID_BLOCK;
+    208            PHY_BLOCK updating_logical_block;
+    209            PHY_BLOCK updating_physical_block;
+    210            //PHY_BLOCK  phy_block;
+    211            ERASE_COUNT updating_block_ec;
+    212            ERASE_COUNT new_area_ec;
+    213            
+    214            do {
+    215              if (is_updating_area == TRUE) {
+    216                updating_logical_block = index_table.area_update_plr.area_updating_logical_block;
+    217                updating_physical_block = index_table.area_update_plr.area_updating_physical_block;
+    218                updating_block_ec = index_table.area_update_plr.area_updating_block_ec;
+    219          
+    220                /* update area table, the 2nd-level index table */
+    221                if (AREA_IsFull(updating_logical_block) == TRUE) {
+    222                  /* update area table in another new area table block.
+    223                   * the new block is only valid after writing index table, so no PLR
+    224                   * issue between writing these two blocks.*/
+    225                  area = AREA_INDEX(updating_logical_block);
+    226                  ret = INDEX_FreeBlock_Get(index_table.area_index_table[area],
+    227                                            &new_area_block, &new_area_ec);
+    228                  if (ret == STATUS_SUCCESS) {
+    229                    /* update info of area index table */
+    230                    INDEX_Update_AreaReclaim(area, new_area_block, new_area_ec);
+    231                    area_reclaim = TRUE;
+    232                  }
+    233                } else {
+    234                  /* update index table with area update info for PLR.
+    235                   * PLR: get the area update info from index table, and check the
+    236                   *      area table if need to update due to PL.*/
+    237                  ret = index_update();
+    238                }
+    239                if (ret == STATUS_SUCCESS) {
+    240                  /* write area block */
+    241                  ret = AREA_Update(updating_logical_block, updating_physical_block,
+    242                                    updating_block_ec);
+    243                  if (ret == STATUS_SUCCESS && area_reclaim == TRUE) {
+    244                    /* update index later than area, if area block reclaimed */
+    245                    ret = index_update();
+    246                  }
+    247                }
+    248                if (ret == STATUS_SUCCESS) {
+    249                  /* CLEAR the area update flag */
+    250                  is_updating_area = FALSE;
+    251                }
+    252              } else {
+    253                /* only update index table */
+    254                ret = index_update();
+    255              }
+    256            } while (ret == STATUS_BADBLOCK);
+    257            return ret;
+    258          }
+    259          
+    260          void INDEX_FreeBlock_GetMaxECBlock(PHY_BLOCK* physical_block,
+    261                                             ERASE_COUNT* block_ec) {
+    262            UINT32 i;
+    263          
+    264            for (i = FREE_BLOCK_COUNT - 1; i > 0; i--) {
+    265              if (index_table.free_block_ect[i] != INVALID_EC) {
+    266                *physical_block = index_table.free_block_table[i];
+    267                *block_ec = index_table.free_block_ect[i];
+    268                break;
+    269              }
+    270            }
+    271          
+    272            return;
+    273          }
+    274          
+    275          void INDEX_FreeBlock_SwapMaxECBlock(PHY_BLOCK min_ec_block, ERASE_COUNT min_ec) {
+    276            UINT32 i;
+    277          
+    278            /* swap for SWL:
+    279             * - find the max ec good block in free block,
+    280             * - re-sort and inset the min ec block
+    281             */
+    282          
+    283            /* GET the max ec good block in the sorted free block */
+    284            for (i = FREE_BLOCK_COUNT - 1; i > 0; i--) {
+    285              if (index_table.free_block_ect[i] != INVALID_EC) {
+    286                break;
+    287              }
+    288            }
+    289          
+    290            if (index_table.free_block_ect[i] != INVALID_EC
+    291                && index_table.free_block_ect[i] > min_ec
+    292                && index_table.free_block_ect[i] - min_ec > STATIC_WL_THRESHOLD) {
+    293              /* insert the min ec block to sorted free block table,
+    294               * continue to scan the free block table to head.
+    295               */
+    296              for (i = i - 1; i > 0; i--) {
+    297                if (index_table.free_block_ect[i] > min_ec) {
+    298                  index_table.free_block_table[i + 1] = index_table.free_block_table[i];
+    299                  index_table.free_block_ect[i + 1] = index_table.free_block_ect[i];
+    300                } else {
+    301                  /* insert the min ec block in current position */
+    302                  index_table.free_block_table[i + 1] = min_ec_block;
+    303                  index_table.free_block_ect[i + 1] = min_ec;
+    304          
+    305                  break;
+    306                }
+    307              }
+    308              /* an special case due to i is unsigned char */
+    309              if (i == 0) {
+    310                if (index_table.free_block_ect[0] > min_ec) {
+    311                  index_table.free_block_table[1] = index_table.free_block_table[0];
+    312                  index_table.free_block_ect[1] = index_table.free_block_ect[0];
+    313          
+    314                  index_table.free_block_table[0] = min_ec_block;
+    315                  index_table.free_block_ect[0] = min_ec;
+    316                } else {
+    317                  /* insert the min ec block in current position */
+    318                  index_table.free_block_table[1] = min_ec_block;
+    319                  index_table.free_block_ect[1] = min_ec;
+    320                }
+    321              }
+    322            }
+    323          }
+    324          
+    325          /* the EC of the free block in FBT:
+    326           * MSB: set when read/program fail, reset if erased successfully
+    327           * when erasing a block in FBT failed, just discard it, and get a new block
+    328           * from IBT! If none in IBT, discard the bad, and get another in FBT.
+    329           */
+    330          STATUS INDEX_FreeBlock_Get(DIE_INDEX die, PHY_BLOCK* block, ERASE_COUNT* ec) {
+    331            STATUS ret;
+    332            UINT32 i;
+    333          
+    334            die = die % TOTAL_DIE_COUNT;
+    335          
+    336            do {
+    337              for (i = 0; i < FREE_BLOCK_COUNT; i++) {
+    338                /* get new block at the head of free block table,
+    339                 * whose ec is min, and in the same die. */
+    340                if (index_table.free_block_table[i] == INVALID_BLOCK) {
+    341                  i = FREE_BLOCK_COUNT;
+    342                  break;
+    343                } else if ((index_table.free_block_table[i] % TOTAL_DIE_COUNT) == die) {
+    344                  *block = index_table.free_block_table[i];
+    345                  break;
+    346                }
+    347              }
+    348              //直接for循环遍历所有free block后，遇到第一个无效块后，返回i=FREE_BLOCK_COUNT
+    349              if (i == FREE_BLOCK_COUNT) {
+    350                /* can not find the block in the same die, get another */
+    351                i = 0;
+    352                *block = index_table.free_block_table[0];
+    353              }
+    354              //返回同一个die中的FBT的第一项，即EC最小的free block 
+    355              if (*block != INVALID_BLOCK) {
+    356                ASSERT(i < FREE_BLOCK_COUNT);
+    357          
+    358                /* no background erase. Erase block before using it. Most of erase
+    359                 * would happen in background reclaim.
+    360                 */
+    361                ret = MTD_Erase(*block);
+    362              } else {
+    363                ret = STATUS_TOOMANY_BADBLOCK;
+    364              }
+    365          
+    366              if (ret != STATUS_SUCCESS) {
+    367                /* discard and log the bad block */
+    368                ANCHOR_LogBadBlock(*block);
+    369              }
+    370          
+    371              if (ret == STATUS_SUCCESS) {
+    372                /* increase erase count of the new free block */
+    373                *ec = index_table.free_block_ect[i] + 1;
+    374              }
+    375              //将FBT各项前移
+    376              if (ret != STATUS_TOOMANY_BADBLOCK) {
+    377                /* move forward all other blocks, discard current block in FBT */
+    378                //for (i = i; i < FREE_BLOCK_COUNT - 1; i++) {
+    379                for (; i < FREE_BLOCK_COUNT - 1; i++) {
+    380                  index_table.free_block_table[i] = index_table.free_block_table[i + 1];
+    381                  index_table.free_block_ect[i] = index_table.free_block_ect[i + 1];
+    382                }
+    383                /* fill the last free block entry with invalid block info */
+    384                ASSERT(i == FREE_BLOCK_COUNT - 1);
+    385                index_table.free_block_table[i] = INVALID_BLOCK;
+    386                index_table.free_block_ect[i] = INVALID_EC;
+    387              }
+    388              /* if not get a free block, and there is good block left (e.g. not
+    389               * too many bad block generated.), try again. */
+    390            } while (ret != STATUS_SUCCESS && ret != STATUS_TOOMANY_BADBLOCK
+    391                && ret != STATUS_SimulatedPowerLoss);
+    392          
+    393            return ret;
+    394          }
+    395          
+    396          void INDEX_FreeBlock_Put(PHY_BLOCK dirty_block, ERASE_COUNT dirty_block_ec) {
+    397            UINT32 i;
+    398            
+    399            /*
+    400             //jsj修改 先擦除一遍块，若是坏块，加入坏块表，
+    401            if (MTD_Erase(dirty_block) != STATUS_SUCCESS) {
+    402              ANCHOR_LogBadBlock(dirty_block);
+    403              (void)ANCHOR_Update();
+    404              return;
+    405            }else{
+    406            */  
+    407             //将物理块加入FBT (按EC递增排序) 
+    408             //由于从free block 往外分配时会先检查是否是坏块，所以不必再此检查是否为坏块  
+    409            /* the last item of FBT will be discarded to insert the new free block */
+    410            for (i = FREE_BLOCK_COUNT - 2; i > 0; i--) {
+    411              /* search the max ec block less than dirty_block_ec */
+    412              if (index_table.free_block_ect[i] > dirty_block_ec) {
+    413                index_table.free_block_table[i + 1] = index_table.free_block_table[i];
+    414                index_table.free_block_ect[i + 1] = index_table.free_block_ect[i];
+    415              } else {
+    416                break;
+    417              }
+    418            }
+    419            /* insert new free block at the position of i+1, or at the beginning */
+    420            if (i > 0) {
+    421              index_table.free_block_table[i + 1] = dirty_block;
+    422              index_table.free_block_ect[i + 1] = dirty_block_ec;
+    423            } else {
+    424              ASSERT(i == 0);
+    425              if (index_table.free_block_ect[0] > dirty_block_ec) {
+    426                index_table.free_block_table[1] = index_table.free_block_table[0];
+    427                index_table.free_block_ect[1] = index_table.free_block_ect[0];
+    428                index_table.free_block_table[0] = dirty_block;
+    429                index_table.free_block_ect[0] = dirty_block_ec;
+    430              } else {
+    431                index_table.free_block_table[1] = dirty_block;
+    432                index_table.free_block_ect[1] = dirty_block_ec;
+    433              }
+    434            }
+    435           //}  
+    436          }
+    437          
+    438          static STATUS index_update() {
+    439            ERASE_COUNT ec;
+    440            PHY_BLOCK free_block;
+    441            STATUS ret = STATUS_SUCCESS;
+    442          
+    443            /* Reclaim and PLR:
+    444             *
+    445             * If area block is updated successfully, its data is valid, and
+    446             * mismatch with index table. So, a PLR info is required in index table.
+    447             *
+    448             * Process:
+    449             * - find the new block, and log PLR info to cfg table.
+    450             *   PLR: find the PLR info in cfg table, try to read
+    451             *        index table in new block. If failed, read the table
+    452             *        still from the old block. Omit the latest reclaim
+    453             *        log, and start another reclaim. The new block is still
+    454             *        a free block in FBT, neither used, nor lost. Only need
+    455             *        to do another erase before get it, and the EC is not
+    456             *        updated, but it is not a big issue due to few PL happened.
+    457             *        We just guartee the integrity and functionality of system.
+    458             * - write index table to new block, with the updated free table
+    459             *   and its ECT.
+    460             *   PLR: nothing to do. The new block is integrity now.
+    461             */
+    462            if (index_next_page == PAGE_PER_PHY_BLOCK) {
+    463              /* log reclaim in cfg table */
+    464              ret = INDEX_FreeBlock_Get(index_block, &free_block, &ec);
+    465              if (ret == STATUS_SUCCESS) {
+    466                ANCHOR_IndexReclaim(index_block, index_block_ec, free_block, ec);
+    467                ret = ANCHOR_Update();
+    468              }
+    469          
+    470              if (ret == STATUS_SUCCESS) {
+    471                /* release the current index block */
+    472                INDEX_FreeBlock_Put(index_block, index_block_ec);
+    473                /* update index block to new free block */
+    474                index_block = free_block;
+    475                index_next_page = 0;
+    476                index_block_ec = ec;
+    477              }
+    478            }
+    479          
+    480            if (ret == STATUS_SUCCESS) {
+    481              /* one page write in index block, NO PLR issue */
+    482              ret = TABLE_Write(index_block, index_next_page, &index_table);
+    483            }
+    484          
+    485            if (ret == STATUS_SUCCESS) {
+    486              index_next_page++;
+    487            } else if (ret == STATUS_BADBLOCK) {
+    488              /* bad block, set the next page offset to toggle index block reclaim. */
+    489              index_next_page = PAGE_PER_PHY_BLOCK;
+    490              /* discard the bad block */
+    491              index_block_ec = INVALID_EC;
+    492            }
+    493            return ret;
+    494          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+      32   INDEX_Format
+        32   -> ANCHOR_IsBadBlock
+        32   -> ANCHOR_LogBadBlock
+        32   -> MTD_Erase
+        32   -> TABLE_Write
+        32   -> uart_printf
+      24   INDEX_FreeBlock_Get
+        24   -> ANCHOR_LogBadBlock
+        24   -> MTD_Erase
+       8   INDEX_FreeBlock_GetMaxECBlock
+      12   INDEX_FreeBlock_Put
+      12   INDEX_FreeBlock_SwapMaxECBlock
+      24   INDEX_Init
+        24   -> TABLE_Read
+        24   -> index_update
+      16   INDEX_Update_AreaReclaim
+        16   -> INDEX_FreeBlock_Put
+       4   INDEX_Update_AreaUpdate
+      40   INDEX_Update_Commit
+        40   -> AREA_IsFull
+        40   -> AREA_Update
+        40   -> INDEX_FreeBlock_Get
+        40   -> INDEX_Update_AreaReclaim
+        40   -> index_update
+      16   index_update
+        16   -> ANCHOR_IndexReclaim
+        16   -> ANCHOR_Update
+        16   -> INDEX_FreeBlock_Get
+        16   -> INDEX_FreeBlock_Put
+        16   -> TABLE_Write
+      40   printint
+        40   -> UartWrite
+        40 __aeabi_uidiv
+        40 __aeabi_uidivmod
+      56   printuint
+        56   -> UartWrite
+        56 __aeabi_uidiv
+        56 __aeabi_uidivmod
+      40   uart_printf
+        40   -> UartWrite
+        40   -> printint
+        40   -> printuint
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable10
+       4  ??DataTable11
+       4  ??DataTable11_1
+       4  ??DataTable12
+       4  ??DataTable12_1
+       4  ??DataTable12_2
+       4  ??DataTable12_3
+       4  ??DataTable12_4
+       4  ??DataTable12_5
+       4  ??DataTable12_6
+       4  ??DataTable12_7
+       4  ??DataTable3
+       4  ??DataTable4
+       4  ??DataTable6
+       4  ??DataTable6_1
+       4  ??DataTable6_2
+       4  ??DataTable6_3
+       4  ??DataTable6_4
+       4  ??DataTable6_5
+       4  ??DataTable7
+       4  ??DataTable7_1
+       4  ??DataTable7_2
+       4  ??DataTable8
+       4  ??DataTable8_1
+       4  ??DataTable8_2
+       4  ??DataTable8_3
+       4  ??DataTable8_4
+       4  ??DataTable9
+       4  ??DataTable9_1
+       4  ??DataTable9_2
+       8  ?_0
+      36  ?_1
+      36  ?_2
+     336  INDEX_Format
+     280  INDEX_FreeBlock_Get
+      64  INDEX_FreeBlock_GetMaxECBlock
+     160  INDEX_FreeBlock_Put
+     238  INDEX_FreeBlock_SwapMaxECBlock
+     174  INDEX_Init
+      58  INDEX_Update_AreaReclaim
+      52  INDEX_Update_AreaUpdate
+     174  INDEX_Update_Commit
+      20  digits
+      20  digits
+       4  index_block
+       4  index_block_ec
+       4  index_next_page
+    2048  index_table
+     168  index_update
+       4  is_updating_area
+     104  printint
+      64  printuint
+     210  uart_printf
+      16  -- Other
+
+ 
+ 2 064 bytes in section .bss
+    40 bytes in section .data
+    96 bytes in section .rodata
+ 2 202 bytes in section .text
+ 
+ 2 202 bytes of CODE  memory
+    96 bytes of CONST memory
+ 2 104 bytes of DATA  memory
+
+Errors: none
+Warnings: none

@@ -1,0 +1,444 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:20
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\flashback.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\flashback.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\flashback.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\flashback.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\fb\flashback.c
+      1          #include <core\inc\cmn.h>
+      2          #include <core\inc\ubi.h>
+      3          #include "cache.h"
+      4          #include "flashback.h"
+      5          #include <core\inc\ubi.h>
+      6          #include <core\inc\ftl.h>
+      7          #include <stdlib.h>
+      8          #include <math.h> //ceil
+      9          
+     10          typedef unsigned long long int UINT64;
+     11          
+     12          CACHE* permissionPages;
+     13          CACHE* currentQueue;
+     14          BOOL setup = FALSE;
+     15          PGADDR currentHead = 0;
+     16          char systemType;
+     17          PGADDR lbaStart;
+     18          UINT16 inode_size, inodes_per_page, group_count, search_size;
+     19          UINT32 start, stride, fbcflag, fbclen;
+     20          UINT32 FB_CACHESIZE = 80;
+     21          BOOL ext3 = FALSE;
+     22          UINT8* UUID;
+     23          
+     24          void FB_PrintWord(PGADDR pg, UINT32 addr)
+     25          {
+     26            UINT8 data_buffer[MPP_SIZE];
+     27            PGADDR block, page;
+     28            STATUS ret = PMT_Search(pg, &block, &page);
+     29            if (ret == STATUS_SUCCESS) {
+     30               ret = UBI_Read(block, page, data_buffer, NULL);
+     31            }
+     32            uart_printf("%d-%d-%d-%d\n", data_buffer[addr], data_buffer[addr + 1], data_buffer[addr + 2], data_buffer[addr + 3]);
+     33          }
+     34          
+     35          BOOL FB_isPermission(PGADDR addr, UINT8* buf)
+     36          {
+     37            if(!setup) return FALSE;
+     38            
+     39            if(CACHE_Contains(permissionPages, addr))
+     40            {
+     41               CACHE_Add(currentQueue, addr);
+     42               return TRUE;
+     43            }
+     44            return FALSE;
+     45          }
+     46               
+     47          void FB_Setup(UINT8* data_buffer)
+     48          {
+     49            currentQueue = CACHE_Create(FB_CACHESIZE, 0);
+     50            //Partition code. We need to check this to figure out whether it's using MBR or GPT.
+     51              UINT8 type = data_buffer[0x1C2];
+     52              
+     53              //uart_printf("system type: %d\n", type);
+     54              
+     55              if(type == 0x83) {
+     56                systemType = 'E';
+     57                start = 3;
+     58                fbcflag = 26;
+     59                fbclen = 2;
+     60              }
+     61              else if(type == 0x07)
+     62              {
+     63                systemType = 'N';
+     64              }
+     65              
+     66              
+     67              //Grab the LBA starting section. Annoyingly, this is little-endian.
+     68              lbaStart = (data_buffer[0x1c6]) |
+     69              (data_buffer[0x1c7] << 8) |
+     70              (data_buffer[0x1c8] << 16) |
+     71              (data_buffer[0x1c9] << 24);
+     72              
+     73              //Convert our LBA from step 1 into a page address
+     74              PGADDR initPage = (int)(lbaStart * ((double)SECTOR_SIZE/PAGE_SIZE));
+     75              
+     76            if(systemType == 'E') {
+     77              
+     78              //Now add 1024 bytes' worth of page size to our setup, as we're looking for a section starting at byte 1024.
+     79              initPage += 1024/PAGE_SIZE;
+     80              
+     81              PGADDR block, page;
+     82              
+     83              //Read the superblock
+     84              STATUS ret = PMT_Search(initPage, &block, &page);
+     85              UINT8 data_buffer[MPP_SIZE];
+     86              if (ret == STATUS_SUCCESS) {
+     87                ret = UBI_Read(block, page, data_buffer, NULL);
+     88              }
+     89              
+     90              UINT32 initialOffset = 1024 % PAGE_SIZE;
+     91              
+     92              //Read some variables from the superblock.
+     93              UINT32 block_size = (data_buffer[initialOffset + 24]) |
+     94              (data_buffer[initialOffset + 25] << 8) |
+     95              (data_buffer[initialOffset + 26] << 16) |
+     96              (data_buffer[initialOffset + 27] << 24);
+     97              
+     98              search_size = (data_buffer[initialOffset + 40]) |
+     99              (data_buffer[initialOffset + 41] << 8) |
+    100              (data_buffer[initialOffset + 42] << 16) |
+    101              (data_buffer[initialOffset + 43] << 24);
+    102              
+    103              UINT32 totalInodes = (data_buffer[initialOffset + 0]) |
+    104              (data_buffer[initialOffset + 1] << 8) |
+    105              (data_buffer[initialOffset + 2] << 16) |
+    106              (data_buffer[initialOffset + 3] << 24);
+    107              
+    108              //If the data in bytes 76-79 is greater than 0, we need to check for inode size
+    109              if(data_buffer[initialOffset + 76] > 0 || data_buffer[initialOffset + 77] > 0 
+    110                 || data_buffer[initialOffset + 78] > 0 || data_buffer[initialOffset + 79] > 0)
+    111              {
+    112                inode_size = data_buffer[initialOffset + 88] | data_buffer[initialOffset + 89] << 8;
+    113                stride = inode_size;
+    114                uart_printf("inode_size: %d\n", inode_size);
+    115              }
+    116              
+    117              //This field is only used after EXT2, so if it has a value we can say that we're on a new version.
+    118              if(data_buffer[initialOffset + 252] != 0)
+    119              {
+    120                ext3 = TRUE;
+    121              }
+    122              
+    123              inodes_per_page = (int) ceil((double)PAGE_SIZE / inode_size);
+    124              
+    125              //Initialize the inodePageIDs array. We'll be filling this now.
+    126              //inodePageIDs = malloc(sizeof(PGADDR) * (totalInodes/search_size));
+    127              
+    128              group_count = (int) ceil((double)totalInodes / search_size);
+    129          
+    130              permissionPages = CACHE_Create(group_count, search_size / inodes_per_page - 1);
+    131              
+    132              if(ext3)
+    133              {
+    134                UUID = malloc(sizeof(UINT8) * 768);
+    135              }
+    136              
+    137              for(int j = 0; j < 768; j++)
+    138              {
+    139                UUID[j] = data_buffer[initialOffset + 256 + j];
+    140              }
+    141              
+    142              //Part 3: The block group descriptors.
+    143              /*Begin by finding the offset for the first block after the superblock.
+    144              The first descriptor begins at byte 2048 of the partition OR the second block, whichever is greater.
+    145              Note that our initialPage assumes we're starting at byte 1024, so we only need go
+    146              1024 bytes further.
+    147              */
+    148              //Block Group Descriptor Initial Byte
+    149              UINT32 bgdIB;
+    150              if(block_size)
+    151              {
+    152                bgdIB = (1024 << block_size) * 2;
+    153              }
+    154              else
+    155              {
+    156                bgdIB = 2048; 
+    157              }
+    158              
+    159              //Calculate the starting page and offset of the group descriptor table.
+    160              PGADDR curPage = initPage + (bgdIB / PAGE_SIZE);
+    161              UINT32 curOffset = bgdIB % PAGE_SIZE;
+    162              UINT32 curTable;
+    163              
+    164              //Read the first page if applicable
+    165              if(curPage != initPage)
+    166              {
+    167                ret = PMT_Search(curPage, &block, &page);
+    168                  if (ret == STATUS_SUCCESS) {
+    169                    ret = UBI_Read(block, page, data_buffer, NULL);
+    170                }
+    171              }
+    172              
+    173              PGADDR pageTrans;
+    174              
+    175              //inodePageIDs = malloc(group_count * sizeof(PGADDR));
+    176              
+    177              //Grab the start block for each inode table and convert to pages.
+    178              for(int i = 0; i < group_count; i++)
+    179              {
+    180                //Begin by grabbing the current table.
+    181                curTable = data_buffer[curOffset + 8] | data_buffer[curOffset + 9] << 8
+    182                  | data_buffer[curOffset + 10] << 16 | data_buffer[curOffset + 11] << 24;
+    183                
+    184                pageTrans = initPage + (int)(curTable * ((1024 << block_size)/ (double) PAGE_SIZE));
+    185                
+    186                CACHE_Add(permissionPages, pageTrans);
+    187                uart_printf("Found group at %d\n", pageTrans);
+    188                
+    189                curOffset += 32;
+    190                
+    191                //If we've exited the current page.
+    192                if(curOffset >= PAGE_SIZE)
+    193                {
+    194                  curPage++;
+    195                  
+    196                  ret = PMT_Search(curPage, &block, &page);
+    197                  if (ret == STATUS_SUCCESS) {
+    198                    ret = UBI_Read(block, page, data_buffer, NULL);
+    199                  }
+    200          
+    201                  
+    202                  curOffset %= PAGE_SIZE;
+    203                }
+    204              }
+    205              
+    206              setup = TRUE;
+    207            }    
+    208          }     
+    209          
+    210          void FB_Rollback()
+    211          {
+    212            PHY_BLOCK block, block2;
+    213            PAGE_OFF page, page2;
+    214            STATUS ret;
+    215            UINT8 buf1[MPP_SIZE];
+    216            UINT8 buf2[MPP_SIZE];
+    217            SPARE spare;
+    218            uart_printf("Rolling back a cache. Size: %d\n", currentQueue->head);
+    219            
+    220            buf1[0] = 0x00;
+    221            //Because for some unfathomable reason, the only way to time this crap is polling from the OS.
+    222            FTL_Write(235001, buf1);
+    223            
+    224            //Commenting the isRollingBack line generates its own test data and I can't be bothered to do better.
+    225            isRollingBack = TRUE;
+    226            for(int i = 0; i < currentQueue->head; i++)
+    227            {
+    228              ret = PMT_Search(currentQueue->contents[i], &block, &page);
+    229              if(ret == STATUS_SUCCESS)
+    230              {
+    231                ret = UBI_Read(block, page, &buf1, spare);
+    232                if(ret == STATUS_FAILURE || spare[2] == 0)
+    233                {
+    234                  continue;
+    235                }
+    236                page2 = spare[2] % 64;
+    237                block2 = spare[2] / 64;
+    238                ret = UBI_Read(block2, page2, &buf2, NULL);
+    239                UINT8 type1, type2;
+    240                
+    241                uart_printf("Investigating %d. Current page: %d, original page: %d\n", currentQueue->contents[i], block*64+page, spare[2]);
+    242                
+    243                if(systemType == 'E')
+    244                {
+    245                  for(int j = 0; j < MPP_SIZE; j+= inode_size)
+    246                  {
+    247                    type1 = buf1[j + 1];
+    248                    type2 = buf2[j + 1];
+    249                    if(type1 >= 0x10 && type1 < 0xD0 && type2 >= 0x10 && type2 < 0xD0)
+    250                    {
+    251                      buf1[j] = buf2[j];
+    252                      buf1[j + 1] = buf2[j + 1];
+    253                      uart_printf("Accepting. Current: %d, original: %d\n", buf1[j + 1] << 8 | buf1[j], buf2[j + 1] << 8 | buf2[j]);
+    254                    }  
+    255                  }
+    256                }
+    257                FTL_Write(currentQueue->contents[i], buf1);
+    258              }
+    259            }
+    260            CACHE_Reset(currentQueue);
+    261            buf1[0] = 0xFF;
+    262            //Because for some unfathomable reason, the only way to time this crap is polling from the OS.
+    263            FTL_Write(235001, buf1);
+    264            isRollingBack = FALSE;
+    265            currentHead++;
+    266          }
+    267          
+    268          void FB_Clear()
+    269          {
+    270            CACHE_Clear(currentQueue);
+    271            currentHead += 2;
+    272          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+       8   FB_Clear
+         8   -> CACHE_Clear
+    2072   FB_PrintWord
+      2072   -> PMT_Search
+      2072   -> UBI_Read
+      2072   -> uart_printf
+    4136   FB_Rollback
+      4136   -> CACHE_Reset
+      4136   -> FTL_Write
+      4136   -> PMT_Search
+      4136   -> UBI_Read
+      4136   -> uart_printf
+      4136 __aeabi_uidivmod
+    2096   FB_Setup
+      2096   -> CACHE_Add
+      2096   -> CACHE_Create
+      2096   -> PMT_Search
+      2096   -> UBI_Read
+      2096   -> __aeabi_d2iz
+      2096   -> __aeabi_ddiv
+      2096   -> __aeabi_dmul
+      2096   -> __aeabi_i2d
+      2096   -> __aeabi_ui2d
+      2096   -> ceil
+      2096   -> malloc
+      2096   -> uart_printf
+      2096 __aeabi_idiv
+      2096 __aeabi_uidivmod
+       8   FB_isPermission
+         8   -> CACHE_Add
+         8   -> CACHE_Contains
+      40   printint
+        40   -> UartWrite
+        40 __aeabi_uidiv
+        40 __aeabi_uidivmod
+      56   printuint
+        56   -> UartWrite
+        56 __aeabi_uidiv
+        56 __aeabi_uidivmod
+      40   uart_printf
+        40   -> UartWrite
+        40   -> printint
+        40   -> printuint
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable4
+       4  ??DataTable4_1
+       4  ??DataTable4_2
+       4  ??DataTable4_3
+       4  ??DataTable4_4
+       4  ??DataTable4_5
+       4  ??DataTable4_6
+       4  ??DataTable5
+       4  ??DataTable5_1
+       4  ??DataTable5_10
+       4  ??DataTable5_11
+       4  ??DataTable5_12
+       4  ??DataTable5_13
+       4  ??DataTable5_14
+       4  ??DataTable5_15
+       4  ??DataTable5_16
+       4  ??DataTable5_2
+       4  ??DataTable5_3
+       4  ??DataTable5_4
+       4  ??DataTable5_5
+       4  ??DataTable5_6
+       4  ??DataTable5_7
+       4  ??DataTable5_8
+       4  ??DataTable5_9
+       4  ??DataTable6
+       4  ??DataTable6_1
+       4  ??DataTable7
+       4  ??DataTable7_1
+       4  ??DataTable7_10
+       4  ??DataTable7_11
+       4  ??DataTable7_12
+       4  ??DataTable7_13
+       4  ??DataTable7_14
+       4  ??DataTable7_2
+       4  ??DataTable7_3
+       4  ??DataTable7_4
+       4  ??DataTable7_5
+       4  ??DataTable7_6
+       4  ??DataTable7_7
+       4  ??DataTable7_8
+       4  ??DataTable7_9
+       8  ?_0
+      16  ?_1
+      16  ?_2
+      20  ?_3
+      32  ?_4
+      56  ?_5
+      40  ?_6
+       4  FB_CACHESIZE
+      22  FB_Clear
+      74  FB_PrintWord
+     356  FB_Rollback
+     798  FB_Setup
+      48  FB_isPermission
+       4  UUID
+       4  currentHead
+       4  currentQueue
+      20  digits
+      20  digits
+       4  ext3
+       4  fbcflag
+       4  fbclen
+       2  group_count
+       2  inode_size
+       2  inodes_per_page
+       4  lbaStart
+       4  permissionPages
+     104  printint
+      64  printuint
+       2  search_size
+       4  setup
+       4  start
+       4  stride
+       1  systemType
+     210  uart_printf
+
+ 
+    53 bytes in section .bss
+    44 bytes in section .data
+   188 bytes in section .rodata
+ 1 840 bytes in section .text
+ 
+ 1 840 bytes of CODE  memory
+   188 bytes of CONST memory
+    97 bytes of DATA  memory
+
+Errors: none
+Warnings: 8

@@ -1,0 +1,637 @@
+###############################################################################
+#
+# IAR ANSI C/C++ Compiler V7.40.5.9725/W32 for ARM        03/Aug/2024  15:00:21
+# Copyright 1999-2015 IAR Systems AB.
+#
+#    Cpu mode     =  thumb
+#    Endian       =  little
+#    Source file  =  C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_data.c
+#    Command line =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_data.c -D BOOT_LEVEL_2
+#        -lcN C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List -o
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj --no_cse
+#        --no_unroll --no_inline --no_code_motion --no_tbaa --no_clustering
+#        --no_scheduling --debug --endian=little --cpu=ARM926EJ-S -e --fpu=None
+#        --dlib_config "C:\Program Files (x86)\IAR Systems\Embedded Workbench
+#        7.2\arm\INC\c\DLib_Config_Normal.h" -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\bsp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\csp\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\lib\ -I
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\..\..\sys\lpc313x\usb\
+#        --cpu_mode thumb -Ol --use_c++_inline
+#    List file    =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\List\ftl_data.lst
+#    Object file  =  
+#        C:\Users\mynec\DegreeWork\fb2\EXT\prj\iar\Debug\Obj\ftl_data.o
+#
+###############################################################################
+
+C:\Users\mynec\DegreeWork\fb2\EXT\core\ftl\ftl_data.c
+      1          /*********************************************************
+      2           * Module name: ftl_data.c
+      3           *
+      4           * Copyright 2010, 2011. All Rights Reserved, Crane Chu.
+      5           *
+      6           * This file is part of OpenNFM.
+      7           *
+      8           * OpenNFM is free software: you can redistribute it and/or 
+      9           * modify it under the terms of the GNU General Public 
+     10           * License as published by the Free Software Foundation, 
+     11           * either version 3 of the License, or (at your option) any 
+     12           * later version.
+     13           * 
+     14           * OpenNFM is distributed in the hope that it will be useful,
+     15           * but WITHOUT ANY WARRANTY; without even the implied 
+     16           * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR 
+     17           * PURPOSE. See the GNU General Public License for more 
+     18           * details.
+     19           *
+     20           * You should have received a copy of the GNU General Public 
+     21           * License along with OpenNFM. If not, see 
+     22           * <http://www.gnu.org/licenses/>.
+     23           *
+     24           * First written on 2010-01-01 by cranechu@gmail.com
+     25           *
+     26           * Module Description:
+     27           *    data journal read/write.
+     28           *
+     29           *********************************************************/
+     30          
+     31          #include <core\inc\cmn.h>
+     32          #include <core\inc\buf.h>
+     33          #include <core\inc\ubi.h>
+     34          #include <sys\sys.h>
+     35          #include <core\fb\flashback.h>
+     36          #include "ftl_inc.h"
+     37          
+     38          //Used to prevent the dirty bit from being set when writing permission.
+     39          BOOL writingPerm = FALSE;
+     40          BOOL isRollingBack = FALSE;
+     41          
+     42          /* journal edition for orderly replay */
+     43          static UINT32 edition_in_hot_journal = 0;
+     44          static UINT32 edition_in_cold_journal = 0;
+     45          
+     46          /* meta data */
+     47          static SPARE hot_meta_data[JOURNAL_BLOCK_COUNT][PAGE_PER_PHY_BLOCK];
+     48          static SPARE cold_meta_data[JOURNAL_BLOCK_COUNT][PAGE_PER_PHY_BLOCK];
+     49          
+     50          /* buffer used in reclaim */
+     51          static SPARE pages_buffer[MPP_SIZE / sizeof(SPARE)];
+     52          static UINT8 data_buffer[MPP_SIZE];
+     53          static LOG_BLOCK dirty_blocks[JOURNAL_BLOCK_COUNT];
+     54          
+     55          STATUS DATA_Format() {
+     56            UINT32 i;
+     57            LOG_BLOCK block = DATA_START_BLOCK;//46
+     58            STATUS ret = STATUS_SUCCESS;
+     59          
+     60            /* init the bdt to all dirty */
+     61            //把所有4096个物理块都标记为脏，即所有块的invalid页都为63
+     62            for (i = 0; i < CFG_LOG_BLOCK_COUNT; i++) {
+     63              block_dirty_table[i] = MAX_DIRTY_PAGES;
+     64            }
+     65          
+     66            /* init the journal blocks in root table */
+     67            for (i = 0; i < JOURNAL_BLOCK_COUNT; i++) {
+     68              if (ret == STATUS_SUCCESS) {
+     69                ret = UBI_Erase(block, block);//擦除data block区第一个块
+     70              }
+     71          
+     72              if (ret == STATUS_SUCCESS) {
+     73                PM_NODE_SET_BLOCKPAGE(root_table.hot_journal[i], block, 0);//设置root table
+     74                block_dirty_table[block] = 0;//将data block区第一个块标记为净，即invalid页为0
+     75                block++;
+     76              }
+     77            }
+     78          
+     79            for (i = 0; i < JOURNAL_BLOCK_COUNT; i++) {
+     80              if (ret == STATUS_SUCCESS) {
+     81                ret = UBI_Erase(block, block);
+     82              }
+     83          
+     84              if (ret == STATUS_SUCCESS) {
+     85                PM_NODE_SET_BLOCKPAGE(root_table.cold_journal[i], block, 0);
+     86                block_dirty_table[block] = 0;
+     87                block++;
+     88              }
+     89            }
+     90          
+     91            for (i = 0; i < JOURNAL_BLOCK_COUNT; i++) {
+     92              if (ret == STATUS_SUCCESS) {
+     93                ret = UBI_Erase(block, block);
+     94              }
+     95          
+     96              if (ret == STATUS_SUCCESS) {
+     97                PM_NODE_SET_BLOCKPAGE(root_table.reclaim_journal[i], block, 0);
+     98                block_dirty_table[block] = 0;
+     99                block++;
+    100              }
+    101            }
+    102          
+    103            return STATUS_SUCCESS;
+    104          }
+    105          
+    106          STATUS DATA_Write(PGADDR addr, void* buffer, BOOL is_hot) {
+    107            UINT32 i;
+    108            UINT32* edition;
+    109            PHY_BLOCK block, block2;
+    110            PAGE_OFF page, page2;
+    111            JOURNAL_ADDR* data_journal;
+    112            SPARE* meta_data;
+    113            STATUS ret = STATUS_SUCCESS;
+    114          
+    115            /* TODO: optimize this critical path */
+    116            /* TODO: Bad Page Marker, skip the bad PAGE instead of bad BLOCK. */
+    117          
+    118            if (is_hot == TRUE) {
+    119              data_journal = root_table.hot_journal;
+    120              meta_data = &(hot_meta_data[0][0]);
+    121              edition = &edition_in_hot_journal;
+    122            } else {
+    123              data_journal = root_table.cold_journal;
+    124              meta_data = &(cold_meta_data[0][0]);
+    125              edition = &edition_in_cold_journal;
+    126            }
+    127          
+    128            /* find an idle non-full block */
+    129            do {
+    130              for (i = 0; i < JOURNAL_BLOCK_COUNT; i++) {
+    131                if (PM_NODE_PAGE(data_journal[i]) < PAGE_PER_PHY_BLOCK - 1) {
+    132                  ret = UBI_ReadStatus(PM_NODE_BLOCK(data_journal[i]));
+    133                  if (ret == STATUS_SUCCESS) {
+    134                    /* success means idle */
+    135                    data_journal = &data_journal[i];
+    136                    meta_data = meta_data + i * PAGE_PER_PHY_BLOCK;
+    137                    break;
+    138                  }
+    139                }
+    140              }
+    141            } while (ret == STATUS_DIE_BUSY);
+    142          
+    143            ASSERT(ret == STATUS_SUCCESS);
+    144            if (buffer != NULL) {
+    145              block = PM_NODE_BLOCK(*data_journal);
+    146              page = PM_NODE_PAGE(*data_journal);
+    147          
+    148              /* prepare spare data, and set in meta table */
+    149              meta_data[page][0] = addr;
+    150              meta_data[page][1] = (*edition);
+    151              
+    152              //If we're trying to cache whatever is being written
+    153              if(setup && !isRollingBack && FB_isPermission(addr,(UINT8*) buffer))
+    154              {
+    155                PMT_Search(addr, &block2, &page2);
+    156                if(block2 != 0 && page2 != 0)
+    157                {
+    158                  meta_data[page][2] = block2*64+ page2;
+    159                  meta_data[page][3] = currentHead;
+    160                  writingPerm = TRUE;
+    161                }
+    162              }
+    163              
+    164              (*edition) = (*edition) + 1;
+    165          
+    166              /* write the page to journal block */
+    167              ret = UBI_Write(block, page, buffer, meta_data[page], TRUE);
+    168              if (ret == STATUS_SUCCESS) {
+    169                /* update PMT */
+    170                ret = PMT_Update(addr, block, page);
+    171              }
+    172          
+    173              if (ret == STATUS_SUCCESS) {
+    174                /* update journal */
+    175                PM_NODE_SET_BLOCKPAGE(*data_journal, block, page + 1);
+    176              }
+    177          
+    178              if (PM_NODE_PAGE(*data_journal) == PAGE_PER_PHY_BLOCK - 1) {
+    179                /* write meta data to last page */
+    180                ret = UBI_Write(block, PAGE_PER_PHY_BLOCK - 1, meta_data, NULL, FALSE);
+    181              }
+    182            } else {
+    183              /* no buffer, so no need to write data. Just treat it as page trim. */
+    184              /* update PMT */
+    185              ret = PMT_Update(addr, INVALID_BLOCK, INVALID_PAGE);
+    186            }
+    187          
+    188            writingPerm = FALSE;
+    189            return ret;
+    190          }
+    191          
+    192          STATUS DATA_Commit() {
+    193            STATUS ret;
+    194          
+    195            ret = HDI_Commit();
+    196            if (ret == STATUS_SUCCESS) {
+    197              ret = PMT_Commit();
+    198            }
+    199          
+    200            if (ret == STATUS_SUCCESS) {
+    201              ret = BDT_Commit();
+    202            }
+    203          
+    204            if (ret == STATUS_SUCCESS) {
+    205              ret = ROOT_Commit();
+    206            }
+    207          
+    208            if (ret == STATUS_SUCCESS) {
+    209              edition_in_hot_journal = 0;
+    210              edition_in_cold_journal = 0;
+    211            }
+    212          
+    213            return ret;
+    214          }
+    215          
+    216          BOOL DATA_IsFull(BOOL hot_journal) {
+    217            UINT32 i;
+    218            BOOL ret = TRUE;
+    219          
+    220            for (i = 0; i < JOURNAL_BLOCK_COUNT; i++) {
+    221              if (hot_journal == TRUE) {//块中页用完返回true，没用完，返回false
+    222                if (PM_NODE_PAGE(root_table.hot_journal[i]) < PAGE_PER_PHY_BLOCK - 1) {
+    223                  ret = FALSE;
+    224                  break;
+    225                }
+    226              } else {
+    227                if (PM_NODE_PAGE(root_table.cold_journal[i]) < PAGE_PER_PHY_BLOCK - 1) {
+    228                  ret = FALSE;
+    229                  break;
+    230                }
+    231              }
+    232            }
+    233          
+    234            return ret;
+    235          }
+    236          
+    237          STATUS DATA_Reclaim(BOOL is_hot) {
+    238            UINT32 i, j;
+    239            UINT32* edition;
+    240            UINT32 total_valid_page = 0;
+    241            PAGE_OFF next_dirty_count = 0;
+    242            PAGE_OFF target_dirty_count = MAX_DIRTY_PAGES;//63
+    243            UINT32 found_block = 0;
+    244            JOURNAL_ADDR* journal;
+    245            JOURNAL_ADDR* exclude_journal;
+    246            SPARE* meta_data;
+    247            UINT32 total_reclaimed_page = 0;
+    248            LOG_BLOCK reclaim_block;
+    249            LOG_BLOCK dirty_block;
+    250            PAGE_OFF reclaim_page = 0;
+    251            PAGE_OFF page;
+    252            SPARE* meta_data_buffer;
+    253            LOG_BLOCK true_block = INVALID_BLOCK;
+    254            PAGE_OFF true_page = INVALID_PAGE;
+    255            SPARE spare;
+    256            STATUS ret = STATUS_SUCCESS;
+    257          
+    258            if (is_hot == TRUE) {
+    259              journal = root_table.hot_journal;
+    260              exclude_journal = root_table.cold_journal;
+    261              meta_data = &(hot_meta_data[0][0]);
+    262              edition = &edition_in_hot_journal;
+    263            } else {
+    264              journal = root_table.cold_journal;
+    265              exclude_journal = root_table.hot_journal;
+    266              meta_data = &(cold_meta_data[0][0]);
+    267              edition = &edition_in_cold_journal;
+    268            }
+    269          
+    270            /* data reclaim process:
+    271             * - flush and release all write buffer
+    272             * - find the dirtiest blocks.
+    273             * - copy valid pages in dirty blocks to reclaim blocks,
+    274             * - update PMT and reclaim journal (keep integrity for PLR)
+    275             * - erase dirtiest blocks, assign to new low EC blocks in same die
+    276             * - update journals: reclaim ==> journal, dirty ==> reclaim
+    277             */
+    278          
+    279            /* flush and release all write buffer */
+    280            if (ret == STATUS_SUCCESS) {
+    281              ret = UBI_Flush();
+    282            }
+    283          
+    284            /* find the dirtiest blocks */
+    285            if (ret == STATUS_SUCCESS) {
+    286              while (found_block != JOURNAL_BLOCK_COUNT) {
+    287                for (i = DATA_START_BLOCK; i <= DATA_LAST_BLOCK; i++) {
+    288                  /* exclude journal blocks */
+    289                  for (j = 0; j < JOURNAL_BLOCK_COUNT; j++) {
+    290                    if (i == PM_NODE_BLOCK(exclude_journal[j])) {
+    291                      /* skip the journal block */
+    292                      break;
+    293                    }
+    294                  }
+    295          
+    296                  if (j < JOURNAL_BLOCK_COUNT) {
+    297                    continue;
+    298                  }
+    299          
+    300                  if (block_dirty_table[i] == target_dirty_count) {
+    301                    dirty_blocks[found_block] = i;
+    302                    total_valid_page += (MAX_DIRTY_PAGES - block_dirty_table[i]);
+    303                    found_block++;
+    304                  } else {
+    305                    /* set the next target dirty count */
+    306                    if (block_dirty_table[i] < target_dirty_count
+    307                        && block_dirty_table[i] > next_dirty_count) {
+    308                      next_dirty_count = block_dirty_table[i];
+    309                    }
+    310                  }
+    311          
+    312                  if (found_block == JOURNAL_BLOCK_COUNT) {
+    313                    break;
+    314                  }
+    315                }
+    316          
+    317                /* find more dirty blocks */
+    318                target_dirty_count = next_dirty_count;
+    319                next_dirty_count = 0;
+    320              }
+    321            }
+    322          
+    323            if (ret == STATUS_SUCCESS) {
+    324              if (total_valid_page != 0) {
+    325                for (j = 0; j < JOURNAL_BLOCK_COUNT; j++) {
+    326                  /* copy valid pages in dirty blocks to reclaim blocks */
+    327                  /* keep integrity before PMT_Update() */
+    328                  reclaim_block = PM_NODE_BLOCK(root_table.reclaim_journal[j]);
+    329                  reclaim_page = 0;
+    330                  dirty_block = dirty_blocks[j];
+    331                  meta_data_buffer = meta_data + j * PAGE_PER_PHY_BLOCK;
+    332          
+    333                  ret = UBI_Read(dirty_block, PAGE_PER_PHY_BLOCK - 1, pages_buffer, NULL);
+    334                  if (ret == STATUS_SUCCESS) {
+    335                    for (page = 0; page < PAGE_PER_PHY_BLOCK - 1; page++) {
+    336                      if (ret == STATUS_SUCCESS) {
+    337                        ret = PMT_Search(pages_buffer[page][0], &true_block, &true_page);//查找各逻辑地址I所对应的块、页号
+    338                      }
+    339          
+    340                      if (ret == STATUS_SUCCESS) {
+    341                        if (true_block == dirty_block && true_page == page) {//若是valid页
+    342                          /* this page is valid */
+    343                          /* copy valid page to reclaim block */
+    344                          ret = UBI_Read(dirty_block, page, data_buffer, spare);
+    345                          if (ret == STATUS_SUCCESS) {
+    346                            /* logical page address is not changed */
+    347                            spare[1] = total_reclaimed_page;
+    348          
+    349                            ret = UBI_Write(reclaim_block, reclaim_page, data_buffer,
+    350                                            spare, FALSE);
+    351                          }
+    352          
+    353                          if (ret == STATUS_SUCCESS) {
+    354                            /* update pmt */
+    355                            ret = PMT_Update(pages_buffer[page][0], reclaim_block,
+    356                                             reclaim_page);
+    357          
+    358                            /* check logical page address */
+    359                            ASSERT(spare[0] == pages_buffer[page][0]);
+    360                            /* check edition number */
+    361                            ASSERT(spare[1] == total_reclaimed_page);
+    362          
+    363                            /* update meta data */
+    364                            meta_data_buffer[reclaim_page][0] = spare[0];
+    365                            meta_data_buffer[reclaim_page][1] = spare[1];
+    366                          }
+    367          
+    368                          if (ret == STATUS_SUCCESS) {
+    369                            reclaim_page++;
+    370                            total_reclaimed_page++;
+    371          
+    372                            /* update journals */
+    373                            PM_NODE_SET_BLOCKPAGE(root_table.reclaim_journal[j],
+    374                                                  reclaim_block, reclaim_page);
+    375                          }
+    376                        }
+    377                      }
+    378                    }
+    379                  }
+    380                }
+    381          
+    382                ASSERT(total_valid_page == total_reclaimed_page);
+    383          
+    384                /* copied all valid page in all dirty blocks.
+    385                 * Erase dirtiest blocks, assign to new low EC blocks in different
+    386                 * dice, and update journals: reclaim ==> journal, dirty ==> reclaim
+    387                 */
+    388                for (j = 0; j < JOURNAL_BLOCK_COUNT; j++) {
+    389                  if (ret == STATUS_SUCCESS) {
+    390                    ret = UBI_Erase(dirty_blocks[j], j);
+    391                  }
+    392          
+    393                  if (ret == STATUS_SUCCESS) {
+    394                    journal[j] = root_table.reclaim_journal[j];
+    395                    PM_NODE_SET_BLOCKPAGE(root_table.reclaim_journal[j], dirty_blocks[j],0);
+    396          
+    397                    /* update blocks: origin journal - not changed
+    398                     *                origin dirty   - clear all dirty
+    399                     *                origin reclaim - not changed, and shoudl be 0
+    400                     */
+    401                    block_dirty_table[dirty_blocks[j]] = 0;
+    402                    block_dirty_table[PM_NODE_BLOCK(journal[j])] = 0;
+    403                  }
+    404                }
+    405              } else {
+    406                /* erase dirty blocks, update journals, and no need to copy pages */
+    407                for (j = 0; j < JOURNAL_BLOCK_COUNT; j++) {
+    408                  if (ret == STATUS_SUCCESS) {
+    409                    ret = UBI_Erase(dirty_blocks[j], j);
+    410                  }
+    411          
+    412                  if (ret == STATUS_SUCCESS) {
+    413                    /* dirty ==> journal, reclaim unchanged */
+    414                    PM_NODE_SET_BLOCKPAGE(journal[j], dirty_blocks[j], 0);
+    415          
+    416                    /* BDT: clear dirty (now journal) */
+    417                    block_dirty_table[dirty_blocks[j]] = 0;
+    418                  }
+    419                }
+    420              }
+    421            }
+    422          
+    423            if (ret == STATUS_SUCCESS) {
+    424              (*edition) = total_valid_page;
+    425            }
+    426          
+    427            return ret;
+    428          }
+    429          
+    430          STATUS DATA_Replay(JOURNAL_ADDR* journals) {
+    431            UINT32 journal_edition = 0;
+    432            UINT32 j_index = 0;
+    433            SPARE* meta_data;
+    434            LOG_BLOCK block;
+    435            PAGE_OFF page;
+    436            SPARE spare;
+    437            UINT32 page_edition;
+    438            PGADDR logical_page_address;
+    439            SPARE* meta_data_buffer;
+    440            STATUS ret = STATUS_SUCCESS;
+    441          
+    442            if (journals == root_table.hot_journal) {
+    443              meta_data = &(hot_meta_data[0][0]);
+    444            } else {
+    445              meta_data = &(cold_meta_data[0][0]);
+    446            }
+    447          
+    448            while (journal_edition != MAX_UINT32) {
+    449              for (j_index = 0; j_index < JOURNAL_BLOCK_COUNT; j_index++) {//1
+    450                block = PM_NODE_BLOCK(journals[j_index]);
+    451                page = PM_NODE_PAGE(journals[j_index]);
+    452          
+    453                if (ret == STATUS_SUCCESS) {
+    454                  ret = UBI_Read(block, page, NULL, spare);
+    455                }
+    456          
+    457                if (ret == STATUS_SUCCESS) {
+    458                  /* this page was written, replay it */
+    459                  logical_page_address = spare[0];
+    460                  page_edition = spare[1];
+    461          
+    462                  if (page_edition != journal_edition) {
+    463                    /* replay pages in the edition order */
+    464                    continue;
+    465                  }
+    466                  /* update PMT */
+    467                  ret = PMT_Update(logical_page_address, block, page);
+    468                }
+    469          
+    470                if (ret == STATUS_SUCCESS) {
+    471                  /* update journal */
+    472                  PM_NODE_SET_BLOCKPAGE(journals[j_index], block, page + 1);
+    473          
+    474                  /* find next edition of journal */
+    475                  journal_edition++;
+    476                  break;
+    477                } else {
+    478                  /* restore the edition */
+    479                  if (journals == root_table.hot_journal) {
+    480                    edition_in_hot_journal = journal_edition;
+    481                  } else {
+    482                    edition_in_cold_journal = journal_edition;
+    483                  }
+    484          
+    485                  /* empty page in this journal block */
+    486                  journal_edition = MAX_UINT32;
+    487                  ret = STATUS_SUCCESS;
+    488                  continue;
+    489                }
+    490              }
+    491            }
+    492          
+    493            /* build up the meta table */
+    494            for (j_index = 0; j_index < JOURNAL_BLOCK_COUNT; j_index++) {//1
+    495              block = PM_NODE_BLOCK(journals[j_index]);
+    496          
+    497              /* point to the right meta data address */
+    498              meta_data_buffer = meta_data + j_index * PAGE_PER_PHY_BLOCK;
+    499          
+    500              for (page = 0; page < PAGE_PER_PHY_BLOCK; page++) {
+    501                if (ret == STATUS_SUCCESS) {
+    502                  ret = UBI_Read(block, page, NULL, spare);
+    503                }
+    504          
+    505                if (ret == STATUS_SUCCESS) {
+    506                  meta_data_buffer[page][0] = spare[0];
+    507                  meta_data_buffer[page][1] = spare[1];
+    508                } else if (page == PAGE_PER_PHY_BLOCK - 1) {
+    509                  /* write meta data to last page */
+    510                  ret = UBI_Write(block, PAGE_PER_PHY_BLOCK - 1, meta_data_buffer, NULL,FALSE);
+    511                } else {
+    512                  ret = STATUS_SUCCESS;
+    513                  break;
+    514                }
+    515              }
+    516            }
+    517          
+    518            return ret;
+    519          }
+
+   Maximum stack usage in bytes:
+
+   .cstack Function
+   ------- --------
+       8   DATA_Commit
+         8   -> BDT_Commit
+         8   -> HDI_Commit
+         8   -> PMT_Commit
+         8   -> ROOT_Commit
+      16   DATA_Format
+        16   -> UBI_Erase
+       8   DATA_IsFull
+      80   DATA_Reclaim
+        80   -> PMT_Search
+        80   -> PMT_Update
+        80   -> UBI_Erase
+        80   -> UBI_Flush
+        80   -> UBI_Read
+        80   -> UBI_Write
+      48   DATA_Replay
+        48   -> PMT_Update
+        48   -> UBI_Read
+        48   -> UBI_Write
+      48   DATA_Write
+        48   -> FB_isPermission
+        48   -> PMT_Search
+        48   -> PMT_Update
+        48   -> UBI_ReadStatus
+        48   -> UBI_Write
+
+
+   Section sizes:
+
+   Bytes  Function/Label
+   -----  --------------
+       4  ??DataTable3
+       4  ??DataTable3_1
+       4  ??DataTable3_10
+       4  ??DataTable3_2
+       4  ??DataTable3_3
+       4  ??DataTable3_4
+       4  ??DataTable3_5
+       4  ??DataTable3_6
+       4  ??DataTable3_7
+       4  ??DataTable3_8
+       4  ??DataTable3_9
+       4  ??DataTable4
+       4  ??DataTable4_1
+       4  ??DataTable4_2
+       4  ??DataTable4_3
+       4  ??DataTable4_4
+       4  ??DataTable4_5
+       4  ??DataTable4_6
+       4  ??DataTable4_7
+       4  ??DataTable4_8
+       4  ??DataTable4_9
+       4  ??DataTable5
+       4  ??DataTable5_1
+       4  ??DataTable5_2
+       4  ??DataTable5_3
+       4  ??DataTable5_4
+       4  ??DataTable5_5
+      68  DATA_Commit
+     196  DATA_Format
+      66  DATA_IsFull
+     700  DATA_Reclaim
+     286  DATA_Replay
+     346  DATA_Write
+    1024  cold_meta_data
+    2048  data_buffer
+       4  dirty_blocks
+       4  edition_in_cold_journal
+       4  edition_in_hot_journal
+    1024  hot_meta_data
+       4  isRollingBack
+    2048  pages_buffer
+       4  writingPerm
+
+ 
+ 6 164 bytes in section .bss
+ 1 770 bytes in section .text
+ 
+ 1 770 bytes of CODE memory
+ 6 164 bytes of DATA memory
+
+Errors: none
+Warnings: none
